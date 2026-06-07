@@ -34,7 +34,7 @@ The list of projects persists to **`~/.pipeline-board/projects.json`**:
 
 ```json
 [
-  { "name": "big-leaves", "path": "/Users/me/projects/big-leaves" },
+  { "name": "feature-pipeline", "path": "/Users/me/projects/feature-pipeline" },
   { "name": "symphony", "path": "/Users/me/projects/symphony" }
 ]
 ```

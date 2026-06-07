@@ -1,118 +1,128 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code when working in this repository.
 
 ## Project Purpose
 
-Pipeline Board is a standalone local web app that provides a Kanban-style dashboard for the **feature-pipeline** Claude Code plugin. It visualizes tickets moving through pipeline stages (backlog → analyze → plan → implement → review → test → done), updates in real-time via filesystem watching, and can trigger pipeline stages by spawning Claude CLI sessions.
+Pipeline Board is a standalone local web app: a **read-only Kanban viewer** for tickets produced by the **feature-pipeline** Claude Code plugin. It scans the `claudedocs/tickets/` folder of one or more configured project roots, parses each ticket's frontmatter, and renders tickets as cards across four columns that mirror the pipeline's real state folders — **Backlog / In Progress / Review / Done** — with a per-card indicator of how far the pipeline has advanced.
 
-This is **not** part of the feature-pipeline plugin — it's a separate project that reads the plugin's file-based state as its single source of truth. There is no database; all state is derived from the filesystem.
+It is **not** part of the feature-pipeline plugin — it's a separate app that reads the plugin's file-based state. There is **no database**: the filesystem is the single source of truth, re-scanned on a short poll.
+
+> The MVP (ticket PB-1) is deliberately small: read-only, polling. It does **not** watch files, spawn CLI sessions, or trigger pipeline stages. See "Out of scope" below for what was intentionally deferred.
+
+## Commands
+
+```bash
+npm run dev        # vite dev on http://localhost:3000
+npm run build      # production build -> .output/ (client + Node server)
+npm start          # run the built Node server (.output/server/index.mjs) on :3000
+npm run typecheck  # tsc --noEmit
+npm test           # vitest run (unit tests)
+```
+
+Production serving works via the Nitro Node-server target (`nitro()` in `vite.config.ts`), which
+emits a runnable `.output/server/index.mjs`. Still a local single-user tool; remote/cloud hosting
+is future work.
+
+> TanStack Start server functions are production-sensitive. This app uses direct
+> `createServerFn` wrappers that delegate to plain server-only helpers inside `.handler()` bodies;
+> that shape is verified in the Node production build. Do **not** call one `createServerFn` from
+> middleware around another server function; TanStack/router #7213 reproduces as
+> "Server function info not found" in production for that shape. Always verify production server
+> functions with a **real browser RPC returning 200 + data**, not just that the page renders.
+
+There is no E2E framework wired in; UI behavior is verified manually / via the feature-pipeline `ui-tester`. **Always smoke-test UI changes in a real browser** — SSR HTML and Node unit tests can pass while the client bundle is broken (see "Server/client boundary").
 
 ## Tech Stack
 
-- **TanStack Start v1.0** — full-stack React framework (server functions + file-based routing + TanStack Query)
-- **TanStack Router** — file-based routing
-- **TanStack Query** — server state management with cache invalidation from SSE events
-- **Chokidar** — filesystem watcher (with `awaitWriteFinish` for editor atomic saves)
-- **SSE (Server-Sent Events)** — one-way real-time push from server to browser via streaming `ReadableStream`
-- **node:child_process.spawn** — spawns `claude` CLI sessions to trigger pipeline stages
-- **gray-matter** — server-side YAML frontmatter parsing for ticket files
-- **react-markdown** — client-side artifact rendering (trusted local content only)
+- **TanStack Start** (`@tanstack/react-start`) — full-stack React: server functions + file-based routing
+- **TanStack Router** — file-based routes under `src/routes/`
+- **TanStack Query** — client data fetching, polling, and cache
+- **React 19**, **Vite 8**, **TypeScript** (strict, `noUncheckedIndexedAccess`)
+- **gray-matter** — server-side YAML frontmatter parsing
+- **react-markdown** — in-panel artifact rendering (trusted local content; raw HTML disabled)
+- **Vitest** — unit tests for the server scanner/config logic
+
+(No chokidar, no SSE, no `child_process` — those belong to deferred features, not the current build.)
 
 ## Architecture
 
 ```
-Browser (React + TanStack Router/Query)
-  │ EventSource (SSE)
+Browser (React + TanStack Query, polls every 5s)
+  │  server-function RPC (DTOs only — never raw fs paths/handles)
   ▼
-TanStack Start Server
-  ├── Server Functions: listTickets, getArtifacts, triggerStage, etc.
-  ├── SSE Stream: chokidar events → EventEmitter → ReadableStream
-  └── CLI Spawner: spawn("claude", [...]) for stage triggers
-         │ reads/writes
-         ▼
-Filesystem (source of truth)
-  ├── .tickets/{backlog,in-progress,review,done}/<PREFIX>-<N>-<slug>.md
-  ├── claudedocs/pipeline/<ticket-id>/00-exploration.md through 07-summary.md
-  └── claudedocs/pipeline/<ticket-id>/.iterations.json
+TanStack Start server (src/server/functions.ts)
+  │  scanAll · listProjects · addProject · removeProject · getArtifact
+  ▼
+TicketSource interface (src/server/ticket-source.ts)   ← the swap seam
+  └─ FilesystemTicketSource (src/server/scanner.ts) — node:fs + gray-matter
+       reads each configured project's  claudedocs/tickets/  tree
 ```
 
-### State Derivation (no database)
+All filesystem access lives in `src/server/` and runs only inside server-function handler bodies. The client receives serialized `TicketDTO`s. A future DB / git / hosted backend implements the same `TicketSource` interface without touching the UI.
 
-- **Ticket column**: determined by `.tickets/` subfolder cross-referenced with artifact presence in `claudedocs/pipeline/<id>/`
-- **Pipeline progress**: which numbered artifacts exist (00–07) maps to how far the pipeline advanced
-- **Needs attention**: a new artifact appearing (via watcher) = stage completed, needs developer review
-- **Running**: a child process is active for that ticket ID
-- **Loop-back state**: `.iterations.json` counters (`review_implement_loops`, `test_implement_loops`, `test_plan_loops`)
-
-### Pipeline Artifact Order
+### Source layout
 
 ```
-00-exploration.md   → discovery output
-01-spec.md          → enriched spec
-02-analysis.md      → analyze stage
-03-plan.md          → plan stage
-04-implementation.md → implement stage (live document, updated incrementally)
-05-review.md        → review stage
-06-tests.md         → test stage
-07-summary.md       → pipeline complete
+src/
+├── router.tsx            # getRouter() — TanStack Start router entry (note: getRouter, not createRouter)
+├── routeTree.gen.ts      # generated by the Start vite plugin on dev/build — do not hand-edit
+├── routes/
+│   ├── __root.tsx        # html shell + per-request QueryClientProvider
+│   └── index.tsx         # renders <Board/>
+├── components/           # Board, Column, TicketCard, ProjectFilter, AddProjectDialog,
+│                         #   DetailPanel, MarkdownView, ProjectErrorChip, EmptyState
+├── lib/query.ts          # poll interval, query keys, priority rank
+├── server/               # SERVER-ONLY (node:fs lives here)
+│   ├── types.ts          # DTOs + enums + STATE_FOLDERS + STAGE_ARTIFACTS
+│   ├── ticket-source.ts  # TicketSource interface (the seam)
+│   ├── scanner.ts        # FilesystemTicketSource: scan/classify/derive/getArtifact + validateProjectPath
+│   ├── config.ts         # ~/.pipeline-board/projects.json (load/save/add/remove)
+│   └── functions.ts      # createServerFn wrappers (the only module client components import)
+└── styles/app.css
 ```
 
-Progress detection checks artifacts in reverse order: presence of `07-summary.md` = complete, `05-review.md` = resume from test, `03-plan.md` = resume from implement, etc.
+## The data contract it reads (feature-pipeline tickets)
 
-### Ticket Format
+The board reads the **current** feature-pipeline ticket layout. State is derived entirely from the filesystem — no DB.
 
-Tickets live in `.tickets/{backlog,in-progress,review,done}/` as markdown files with YAML frontmatter:
-
-```yaml
----
-id: PB-1
-title: Pipeline Board UI
-priority: high
-complexity: XL
-status: backlog
-created: 2026-04-13
-project: pipeline-board
-tags: [ui, dashboard, kanban]
----
+```
+<project-root>/claudedocs/tickets/
+├── config.yaml                # { prefix: PB }
+├── backlog/  in-progress/  review/  done/     # the four state folders (review/ & done/ may be absent)
+└── <state>/<TICKET-ID>/       # folder name IS the ticket id (no slug)
+    ├── 01-spec.md             # the ticket: YAML frontmatter + body
+    ├── exploration.md         # optional (discover output)
+    ├── 02-plan.md  03-implementation.md  04-review.md  05-tests.md  06-summary.md
 ```
 
-Ticket ID prefix is stored in `.tickets/.prefix` (plain text, e.g., "PB"). ID format: `<PREFIX>-<N>` (no leading zeros). Filename: `<PREFIX>-<N>-<slug>.md`.
+- **Column** = the ticket's physical state folder (most faithful to the real layout).
+- **Status badge** = frontmatter `status` (`backlog · in-progress · in-review · done · partial-completion · cancelled`). `in-review` lives in `review/`; `done`/`partial-completion`/`cancelled` live in `done/`. When status and folder disagree, the folder wins for the column and a subtle mismatch flag is shown.
+- **Derived stage** = furthest of `02`→`06` present (`spec → planned → implementing → reviewed → tested → summarized`).
+- **Epics** (`prd.md` with `kind: epic` + `tasks/<child>/`) are detected and **skipped** in this version (a dedicated epic view is future work). The scanner must never crash on them.
+- **Degraded cards**: unparseable/empty frontmatter → a card using the folder name as id, with a metadata-error marker (never silently dropped).
 
-### CLI Invocation Pattern
+Scanning is one level deep per state folder; epic `tasks/` subtrees are not descended.
 
-```bash
-# Trigger a specific stage
-claude -p "Run /feature-pipeline:analyze PB-1" --yes
+## Configuration (the board's own)
 
-# Trigger full pipeline from a stage
-claude -p "Run /feature-pipeline:feature-flow PB-1 --from analyze" --yes
-```
+Which project folders the board shows is the board's *own* config (not ticket data), persisted to **`~/.pipeline-board/projects.json`** as `{ name, path }[]`. A "project" is any folder containing `claudedocs/tickets/`. Seed on first run with `PIPELINE_BOARD_PROJECTS="/path/a,/path/b"`; override the config dir in tests with `PIPELINE_BOARD_CONFIG_DIR`.
 
-### Filesystem Watch Targets
+## Key constraints & conventions
 
-- `.tickets/**/*.md` — ticket lifecycle (folder moves, frontmatter changes)
-- `claudedocs/pipeline/**/*.md` — artifact creation/updates
-- `claudedocs/pipeline/**/.iterations.json` — loop-back state changes
+- **Read-only** — never write to, move, or delete anything under a project's `claudedocs/tickets/`. The only files the app writes are its own `~/.pipeline-board/` config.
+- **No database** — derive everything from the filesystem each scan.
+- **Server/client boundary** — `node:fs`/`os`/`path` must stay in `src/server/` modules and be used only inside `createServerFn().handler()` bodies. `functions.ts` (the module client components import) must have **no** top-level Node-builtin imports and **no** plain (non-server-fn) exports that use them — otherwise the Node import leaks into the client bundle and crashes on hydration, which SSR and unit tests will not catch. (This is why `validateProjectPath` lives in `scanner.ts`, not `functions.ts`.) Middleware may call plain server-only helpers, but must not call another `createServerFn`.
+- **TicketSource seam** — all ticket reads go through the interface so the storage backend can be swapped later.
+- **Single user, local** — no auth, no multi-user, desktop-first.
 
-### Configuration
+## Out of scope (deferred — not built in PB-1)
 
-The app needs the project root where `.tickets/` and `claudedocs/` live:
-- CLI argument: `npm run dev -- --project /path/to/project`
-- Environment variable: `PIPELINE_PROJECT_ROOT=/path/to/project`
-- Default: current working directory
+Epic rendering/view · real-time updates (file watching / SSE) · triggering pipeline stages / spawning `claude` CLI · database (SQLite/managed) · remote hosting (DigitalOcean) · ticket editing in the UI · auth · mobile-first. The `TicketSource` seam keeps the door open for the DB/git/hosted variants.
 
-## Key Constraints
+## This repo's own development
 
-- **No own database** — filesystem is the single source of truth
-- **No drag-and-drop for stage transitions** — stages spawn CLI sessions (heavy operations), use buttons with confirmation
-- **No ticket editing in UI** — tickets are created/modified via Claude Code
-- **No embedded terminal** — CLI sessions open in external terminal (MVP)
-- **Single user, local only** — no auth, no multi-user, no mobile-first
-- **SSE not WebSocket** — simpler, auto-reconnect via EventSource, sufficient for one-way notifications
+This project dogfoods feature-pipeline for its own work. Tickets live in `claudedocs/tickets/` (prefix `PB`, per `claudedocs/tickets/config.yaml`); cross-ticket lessons accumulate in `claudedocs/tickets/_lessons.md`. `claudedocs/` is git-ignored, so ticket bookkeeping stays out of feature PRs.
 
-## Project Documentation
-
-- **Ticket**: `.tickets/backlog/PB-1-pipeline-board-ui.md` — full requirements and acceptance criteria
-- **Research**: `claudedocs/research_pipeline-board-ui_2026-04-13.md` — landscape analysis, UX patterns, technical recommendations
-- **Exploration**: `claudedocs/pipeline/PB-1/00-exploration.md` — feature-pipeline plugin architecture analysis
+- **PB-1** (`claudedocs/tickets/review/PB-1/`) — the initial board; full spec, plan, and pipeline artifacts.
+- **Research**: `claudedocs/research_pipeline-board-ui_2026-04-13.md` — landscape + UX patterns (the chokidar/SSE/CLI-spawning recommendations there describe a heavier design than the read-only MVP that was built).

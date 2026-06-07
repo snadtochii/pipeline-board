@@ -1,4 +1,4 @@
-# Pipeline Board
+# Pipeline Board (prototype)
 
 A local, read-only Kanban board for [feature-pipeline](https://) tickets. It scans the
 `claudedocs/tickets/` folder of one or more project roots and shows each ticket as a card in

@@ -1,0 +1,33 @@
+{
+  "name": "pipeline-board",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "description": "Local read-only Kanban viewer for feature-pipeline tickets",
+  "scripts": {
+    "dev": "vite dev --port 3000",
+    "build": "vite build",
+    "start": "node .output/server/index.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@tanstack/react-query": "5.101.0",
+    "@tanstack/react-router": "1.170.15",
+    "@tanstack/react-start": "1.168.25",
+    "gray-matter": "4.0.3",
+    "react": "19.2.7",
+    "react-dom": "19.2.7",
+    "react-markdown": "10.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "25.9.2",
+    "@types/react": "19.2.17",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "5.2.0",
+    "nitro": "^3.0.260603-beta",
+    "typescript": "6.0.3",
+    "vite": "7.3.5",
+    "vitest": "4.1.8"
+  }
+}

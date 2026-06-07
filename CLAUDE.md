@@ -96,13 +96,13 @@ The board reads the **current** feature-pipeline ticket layout. State is derived
     ├── 02-plan.md  03-implementation.md  04-review.md  05-tests.md  06-summary.md
 ```
 
-- **Column** = the ticket's physical state folder (most faithful to the real layout).
-- **Status badge** = frontmatter `status` (`backlog · in-progress · in-review · done · partial-completion · cancelled`). `in-review` lives in `review/`; `done`/`partial-completion`/`cancelled` live in `done/`. When status and folder disagree, the folder wins for the column and a subtle mismatch flag is shown.
+- **Column** = the ticket's **status-derived** column, `expectedFolderForStatus(status)`, for both solo tickets and epic children (`in-review → review`; `done`/`partial-completion`/`cancelled → done`; `backlog`/`in-progress` map to themselves). The physical state folder is informational. This is load-bearing for epic children: an epic subtree moves between state folders as one unit, so per-child `status` (in each child's `01-spec.md`) is the only thing that can tell siblings apart.
+- **Status badge** = frontmatter `status` (`backlog · in-progress · in-review · done · partial-completion · cancelled`). `in-review` lives in `review/`; `done`/`partial-completion`/`cancelled` live in `done/`. When a **solo** ticket's physical folder ≠ its status-derived column, a subtle **stale-folder** warning is shown. The warning is suppressed for epic children (their folder is the shared epic's by design, so divergence is expected, not an anomaly).
 - **Derived stage** = furthest of `02`→`06` present (`spec → planned → implementing → reviewed → tested → summarized`).
-- **Epics** (`prd.md` with `kind: epic` + `tasks/<child>/`) are detected and **skipped** in this version (a dedicated epic view is future work). The scanner must never crash on them.
-- **Degraded cards**: unparseable/empty frontmatter → a card using the folder name as id, with a metadata-error marker (never silently dropped).
+- **Epic children** (`<state>/<EPIC-ID>/tasks/<CHILD-ID>/`) **are surfaced** as cards in their status-derived columns, each carrying a `parentEpicId` (a subtle epic chip distinguishes them). The **epic itself** (`prd.md` with `kind: epic`) is still **not** rendered as a card and gets no dedicated view (future work). The scanner must never crash on a malformed epic (missing/empty `tasks/`, a child without `01-spec.md`, a nested epic) — such cases are skipped or degraded gracefully.
+- **Degraded cards**: unparseable/empty frontmatter → a card using the folder name as id, with a metadata-error marker (never silently dropped). A degraded **solo** falls back to its own physical folder (its real state); a degraded **child** is placed in **Backlog** (its folder is the epic's, which can't stand in for its status).
 
-Scanning is one level deep per state folder; epic `tasks/` subtrees are not descended.
+Scanning is one level deep per state folder, **plus exactly one extra level into an epic's `tasks/`** for its children — no deeper recursion. Child artifacts are read back from `<state>/<EPIC-ID>/tasks/<CHILD-ID>/` via `getArtifact`'s `parentEpicId` parameter.
 
 ## Configuration (the board's own)
 

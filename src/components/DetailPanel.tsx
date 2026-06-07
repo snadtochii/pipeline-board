@@ -40,7 +40,7 @@ export function DetailPanel({
   const artifactQ = useQuery({
     queryKey:
       ticket && selectedFile
-        ? queryKeys.artifact(ticket.projectName, ticket.id, selectedFile)
+        ? queryKeys.artifact(ticket.projectName, ticket.id, selectedFile, ticket.parentEpicId)
         : ['artifact', 'none'],
     queryFn: () =>
       getArtifact({
@@ -48,6 +48,7 @@ export function DetailPanel({
           projectName: ticket!.projectName,
           ticketId: ticket!.id,
           filename: selectedFile!,
+          parentEpicId: ticket!.parentEpicId,
         },
       }),
     enabled: Boolean(ticket && selectedFile),
@@ -71,9 +72,10 @@ export function DetailPanel({
         {ticket.status && <span className={`status status-${ticket.status}`}>{ticket.status}</span>}
         {ticket.priority && <span className="meta-chip">priority: {ticket.priority}</span>}
         {ticket.complexity && <span className="meta-chip">complexity: {ticket.complexity}</span>}
+        {ticket.parentEpicId && <span className="meta-chip">epic: {ticket.parentEpicId}</span>}
         <span className="meta-chip">project: {ticket.projectName}</span>
         <span className="meta-chip">column: {ticket.column}</span>
-        {ticket.mismatch && <span className="warn">⚠ folder/status mismatch</span>}
+        {ticket.staleFolder && <span className="warn">⚠ stale folder</span>}
       </div>
 
       {ticket.tags.length > 0 && (

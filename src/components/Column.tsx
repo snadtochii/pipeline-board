@@ -31,7 +31,7 @@ export function Column({
         ) : (
           tickets.map((t) => (
             <TicketCard
-              key={`${t.projectName}:${t.id}`}
+              key={`${t.projectName}:${t.parentEpicId ?? ''}:${t.id}`}
               ticket={t}
               showProject={showProject}
               onClick={() => onSelect(t)}

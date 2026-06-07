@@ -48,11 +48,17 @@ export function Board() {
   }, [projects, filter])
 
   // Dismiss the detail panel if its ticket is gone (project removed, ticket deleted).
+  // Match on (id, parentEpicId) so a solo and an epic child sharing a leaf id —
+  // or two children of different epics — are never confused.
   useEffect(() => {
     if (
       selected &&
       !results.some(
-        (r) => r.name === selected.projectName && r.tickets.some((t) => t.id === selected.id),
+        (r) =>
+          r.name === selected.projectName &&
+          r.tickets.some(
+            (t) => t.id === selected.id && t.parentEpicId === selected.parentEpicId,
+          ),
       )
     ) {
       setSelected(null)

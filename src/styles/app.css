@@ -277,6 +277,15 @@ button.icon {
   border-radius: 4px;
   padding: 1px 6px;
 }
+/* Subtle parent-epic marker on child task cards. */
+.epic-chip {
+  font-size: 11px;
+  color: var(--muted);
+  background: var(--panel);
+  border: 1px dashed var(--border);
+  border-radius: 4px;
+  padding: 1px 6px;
+}
 .warn {
   font-size: 11px;
   color: var(--warn);

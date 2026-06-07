@@ -31,7 +31,7 @@ const STATUSES: readonly TicketStatus[] = [
 // Pure helpers — unit-tested directly, no filesystem.
 // ----------------------------------------------------------------------------
 
-/** Folder a ticket SHOULD sit in for a given status (for mismatch detection). */
+/** The column a ticket belongs in for a given status — the single status→column map. */
 export function expectedFolderForStatus(status: TicketStatus): Column {
   switch (status) {
     case 'backlog':
@@ -47,10 +47,34 @@ export function expectedFolderForStatus(status: TicketStatus): Column {
   }
 }
 
-/** True when frontmatter status maps to a different folder than the one it sits in. */
-export function detectMismatch(status: TicketStatus | null, folder: Column): boolean {
-  if (status === null) return false // degraded card — don't double-flag
-  return expectedFolderForStatus(status) !== folder
+/**
+ * The status-derived display column for a ticket.
+ * - status present → its expected column.
+ * - degraded child (null status) → backlog (never silently dropped).
+ * - degraded solo (null status) → its physical folder (its real on-disk state).
+ */
+export function deriveColumn(
+  status: TicketStatus | null,
+  physicalFolder: Column,
+  isChild: boolean,
+): Column {
+  if (status !== null) return expectedFolderForStatus(status)
+  return isChild ? 'backlog' : physicalFolder
+}
+
+/**
+ * True when a ticket's physical folder ≠ its status-derived column (a stale
+ * folder — the card shows in a different column than where it physically sits).
+ * Suppressed for epic children (their folder is the shared epic's by design) and
+ * for degraded cards (null status — don't double-flag).
+ */
+export function detectStaleFolder(
+  status: TicketStatus | null,
+  physicalFolder: Column,
+  isChild: boolean,
+): boolean {
+  if (status === null || isChild) return false
+  return expectedFolderForStatus(status) !== physicalFolder
 }
 
 /** Furthest pipeline stage reached, from the set of present artifact filenames. */
@@ -168,8 +192,10 @@ async function buildTicket(
   folder: Column,
   projectName: string,
   names: readonly string[],
+  parentEpicId?: string,
 ): Promise<TicketDTO> {
   const artifacts = names.filter(isArtifactName).sort()
+  const isChild = parentEpicId !== undefined
 
   let meta: ParsedSpecMeta
   try {
@@ -184,14 +210,54 @@ async function buildTicket(
     priority: meta.priority,
     complexity: meta.complexity,
     status: meta.status,
-    column: folder, // folder location determines the column
+    column: deriveColumn(meta.status, folder, isChild), // status-derived; folder is informational
     derivedStage: deriveStage(names),
     projectName,
     tags: meta.tags,
+    ...(parentEpicId !== undefined ? { parentEpicId } : {}),
     artifacts,
-    mismatch: detectMismatch(meta.status, folder),
+    staleFolder: detectStaleFolder(meta.status, folder, isChild),
     metadataError: meta.metadataError,
   }
+}
+
+/**
+ * Read an epic's `tasks/<child>/` subtree one level deep. Each child dir with an
+ * `01-spec.md` becomes a child ticket (status-derived column + parent epic id).
+ * Never throws — a missing/empty/unreadable `tasks/` yields no children, and a
+ * child without `01-spec.md` (incl. a nested epic with only `prd.md`) is skipped.
+ * Does NOT recurse into a child's own `tasks/` (exactly one extra level).
+ */
+async function scanEpicChildren(
+  epicDir: string,
+  epicName: string,
+  folder: Column,
+  projectName: string,
+): Promise<TicketDTO[]> {
+  const tasksDir = join(epicDir, 'tasks')
+  let entries
+  try {
+    entries = await fs.readdir(tasksDir, { withFileTypes: true })
+  } catch {
+    return [] // no tasks/ (or unreadable) → no children, no crash
+  }
+  const children: TicketDTO[] = []
+  for (const ent of entries) {
+    if (!ent.isDirectory() || ent.name.startsWith('.')) continue
+    const childDir = join(tasksDir, ent.name)
+    let names: string[]
+    try {
+      const dirEntries = await fs.readdir(childDir, { withFileTypes: true })
+      names = dirEntries.filter((e) => e.isFile()).map((e) => e.name)
+    } catch {
+      continue // unreadable child dir → skip
+    }
+    // A renderable child must carry its own spec; no spec (or a nested epic with
+    // only prd.md) is skipped. Degraded-but-present specs still build (→ backlog).
+    if (!names.includes('01-spec.md')) continue
+    children.push(await buildTicket(childDir, ent.name, folder, projectName, names, epicName))
+  }
+  return children
 }
 
 function projError(
@@ -247,28 +313,46 @@ export async function scanProjectRoot(project: Project): Promise<ProjectScanResu
       const kind = await classifyDir(dir, names)
       if (kind === 'solo') {
         tickets.push(await buildTicket(dir, ent.name, folder, project.name, names))
+      } else if (kind === 'epic') {
+        // Surface the epic's child tasks with status-derived columns; the epic
+        // itself is never rendered as a card. Descends exactly one extra level.
+        tickets.push(...(await scanEpicChildren(dir, ent.name, folder, project.name)))
       }
-      // 'epic' → deferred (skip subtree); 'unknown' → skip (not a renderable ticket)
+      // 'unknown' → skip (not a renderable ticket)
     }
   }
 
   return { name: project.name, path: project.path, error: null, tickets }
 }
 
-/** Read one artifact's markdown, with whitelist + path-traversal guards. */
+/**
+ * Read one artifact's markdown, with whitelist + path-traversal guards.
+ * Solo ticket: `<state>/<ticketId>/<filename>`. Epic child (parentEpicId given):
+ * `<state>/<parentEpicId>/tasks/<ticketId>/<filename>`. Either way the four state
+ * folders are tried in turn (the physical folder isn't on the wire), so a
+ * stale-folder ticket resolves wherever it actually sits.
+ */
 export async function getArtifactFromRoot(
   project: Project,
   ticketId: string,
   filename: string,
+  parentEpicId?: string,
 ): Promise<ArtifactResult> {
-  if (!isSafeSegment(ticketId) || !isAllowedArtifactName(filename)) {
+  if (
+    !isSafeSegment(ticketId) ||
+    !isAllowedArtifactName(filename) ||
+    (parentEpicId !== undefined && !isSafeSegment(parentEpicId))
+  ) {
     return { found: false, content: null, error: 'Invalid ticket id or artifact name' }
   }
   const ticketsRoot = join(project.path, 'claudedocs', 'tickets')
   for (const folder of STATE_FOLDERS) {
-    const ticketDir = join(ticketsRoot, folder, ticketId)
+    const ticketDir =
+      parentEpicId !== undefined
+        ? join(ticketsRoot, folder, parentEpicId, 'tasks', ticketId)
+        : join(ticketsRoot, folder, ticketId)
     const candidate = join(ticketDir, filename)
-    if (!isInside(ticketDir, candidate)) continue // defense-in-depth
+    if (!isInside(ticketsRoot, candidate)) continue // defense-in-depth
     try {
       const raw = await fs.readFile(candidate, 'utf8')
       return { found: true, content: stripFrontmatter(raw) }

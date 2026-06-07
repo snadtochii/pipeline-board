@@ -71,22 +71,37 @@ export const removeProject = createServerFn({ method: 'POST' })
   .handler(async ({ data }): Promise<Project[]> => removeProjectConfig(data.path))
 
 export const getArtifact = createServerFn({ method: 'GET' })
-  .validator((input: { projectName: string; ticketId: string; filename: string }) => {
-    if (
-      !input ||
-      typeof input.projectName !== 'string' ||
-      typeof input.ticketId !== 'string' ||
-      typeof input.filename !== 'string'
-    ) {
-      throw new Error('projectName, ticketId and filename are required')
-    }
-    return input
-  })
+  .validator(
+    (input: {
+      projectName: string
+      ticketId: string
+      filename: string
+      parentEpicId?: string
+    }) => {
+      if (
+        !input ||
+        typeof input.projectName !== 'string' ||
+        typeof input.ticketId !== 'string' ||
+        typeof input.filename !== 'string'
+      ) {
+        throw new Error('projectName, ticketId and filename are required')
+      }
+      if (input.parentEpicId !== undefined && typeof input.parentEpicId !== 'string') {
+        throw new Error('parentEpicId must be a string when provided')
+      }
+      return input
+    },
+  )
   .handler(async ({ data }): Promise<ArtifactResult> => {
     const projects = await loadProjects()
     // Resolve by display name (the key the client holds). Names are expected unique;
     // first match wins on the rare collision.
     const project = projects.find((p) => p.name === data.projectName)
     if (!project) return { found: false, content: null, error: 'Unknown project' }
-    return filesystemTicketSource.getArtifact(project, data.ticketId, data.filename)
+    return filesystemTicketSource.getArtifact(
+      project,
+      data.ticketId,
+      data.filename,
+      data.parentEpicId,
+    )
   })

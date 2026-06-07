@@ -10,10 +10,16 @@ export interface TicketSource {
   /** Scan one project root and return its tickets (never throws — errors land in result.error). */
   scanProject(project: Project): Promise<ProjectScanResult>
 
-  /** Read a single artifact's markdown for a ticket in a project. */
+  /**
+   * Read a single artifact's markdown for a ticket in a project. When
+   * `parentEpicId` is given the ticket is an epic child and the artifact is
+   * resolved at `<state>/<parentEpicId>/tasks/<ticketId>/<filename>`; otherwise
+   * it is a solo ticket at `<state>/<ticketId>/<filename>`.
+   */
   getArtifact(
     project: Project,
     ticketId: string,
     filename: string,
+    parentEpicId?: string,
   ): Promise<ArtifactResult>
 }

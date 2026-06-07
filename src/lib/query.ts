@@ -6,8 +6,10 @@ export const POLL_INTERVAL_MS = 5000
 export const queryKeys = {
   scan: ['scan'] as const,
   projects: ['projects'] as const,
-  artifact: (project: string, ticket: string, file: string) =>
-    ['artifact', project, ticket, file] as const,
+  // parentEpicId is part of the key so an epic child and a same-id solo (or a
+  // child of another epic) never share a cache entry.
+  artifact: (project: string, ticket: string, file: string, parentEpicId?: string) =>
+    ['artifact', project, parentEpicId ?? '', ticket, file] as const,
 }
 
 /** Higher rank sorts first within a column. */

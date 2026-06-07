@@ -54,10 +54,15 @@ export function TicketCard({
         {ticket.status && (
           <span className={`status status-${ticket.status}`}>{ticket.status}</span>
         )}
+        {ticket.parentEpicId && (
+          <span className="epic-chip" title={`child of epic ${ticket.parentEpicId}`}>
+            {ticket.parentEpicId}
+          </span>
+        )}
         {showProject && <span className="proj" title="project">{ticket.projectName}</span>}
-        {ticket.mismatch && (
-          <span className="warn" title="frontmatter status disagrees with the folder it sits in">
-            ⚠ mismatch
+        {ticket.staleFolder && (
+          <span className="warn" title="physical folder differs from the status-derived column">
+            ⚠ stale folder
           </span>
         )}
         {ticket.metadataError && (

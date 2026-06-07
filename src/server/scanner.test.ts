@@ -3,8 +3,9 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  deriveColumn,
   deriveStage,
-  detectMismatch,
+  detectStaleFolder,
   expectedFolderForStatus,
   getArtifactFromRoot,
   isAllowedArtifactName,
@@ -26,18 +27,37 @@ describe('deriveStage', () => {
   })
 })
 
-describe('mismatch detection', () => {
+describe('expectedFolderForStatus', () => {
   it('maps the three done-family statuses to the done folder', () => {
     expect(expectedFolderForStatus('done')).toBe('done')
     expect(expectedFolderForStatus('partial-completion')).toBe('done')
     expect(expectedFolderForStatus('cancelled')).toBe('done')
   })
-  it('flags a status that points at a different folder', () => {
-    expect(detectMismatch('done', 'in-progress')).toBe(true)
-    expect(detectMismatch('in-review', 'review')).toBe(false)
+})
+
+describe('deriveColumn', () => {
+  it('derives the column from status when present (solo or child)', () => {
+    expect(deriveColumn('in-review', 'in-progress', false)).toBe('review')
+    expect(deriveColumn('done', 'in-progress', true)).toBe('done')
+  })
+  it('falls back to the physical folder for a degraded solo', () => {
+    expect(deriveColumn(null, 'in-progress', false)).toBe('in-progress')
+  })
+  it('falls back to Backlog for a degraded child', () => {
+    expect(deriveColumn(null, 'review', true)).toBe('backlog')
+  })
+})
+
+describe('detectStaleFolder', () => {
+  it('flags a solo whose status points at a different folder', () => {
+    expect(detectStaleFolder('done', 'in-progress', false)).toBe(true)
+    expect(detectStaleFolder('in-review', 'review', false)).toBe(false)
+  })
+  it('never flags an epic child (folder is the epic’s by design)', () => {
+    expect(detectStaleFolder('done', 'in-progress', true)).toBe(false)
   })
   it('never flags a null status (degraded card)', () => {
-    expect(detectMismatch(null, 'backlog')).toBe(false)
+    expect(detectStaleFolder(null, 'backlog', false)).toBe(false)
   })
 })
 
@@ -136,13 +156,25 @@ beforeAll(async () => {
   })
   await writeTicket('done', 'PB-13', { '01-spec.md': spec({ title: 'Thirteen', status: 'done' }) })
   await writeTicket('done', 'PB-14', { '01-spec.md': spec({ title: 'Fourteen', status: 'partial-completion' }) })
-  // status/folder mismatch: status done but sitting in in-progress
+  // stale folder (solo): status done but sitting in in-progress → shows in Done
   await writeTicket('in-progress', 'PB-15', { '01-spec.md': spec({ title: 'Fifteen', status: 'done' }) })
   // broken frontmatter → degraded card
   await writeTicket('in-progress', 'PB-16', { '01-spec.md': '---\nstatus: [oops\n---\nbody' })
-  // epic → skipped, child must NOT surface
+  // epic in backlog/ whose children carry differing statuses — all physically in
+  // backlog/EPIC-1/tasks/ but each lands in its status-derived column.
   await writeTicket('backlog', 'EPIC-1', { 'prd.md': spec({ title: 'Epic', kind: 'epic', status: 'backlog' }) })
-  await writeTicket('backlog', join('EPIC-1', 'tasks', 'PB-20'), { '01-spec.md': spec({ title: 'Child', status: 'backlog' }) })
+  await writeTicket('backlog', join('EPIC-1', 'tasks', 'PB-20'), { '01-spec.md': spec({ title: 'Child A', status: 'backlog' }) })
+  await writeTicket('backlog', join('EPIC-1', 'tasks', 'PB-21'), { '01-spec.md': spec({ title: 'Child B', status: 'in-progress' }) })
+  await writeTicket('backlog', join('EPIC-1', 'tasks', 'PB-22'), {
+    '01-spec.md': spec({ title: 'Child C', status: 'done' }),
+    '02-plan.md': '# p',
+  })
+  // degraded child (broken frontmatter) → Backlog, metadata-error, never dropped
+  await writeTicket('backlog', join('EPIC-1', 'tasks', 'PB-23'), { '01-spec.md': '---\nstatus: [oops\n---\nbody' })
+  // nested epic / child without 01-spec.md → skipped, not recursed
+  await writeTicket('backlog', join('EPIC-1', 'tasks', 'PB-24'), { 'prd.md': spec({ title: 'Nested', kind: 'epic', status: 'backlog' }) })
+  // malformed epic: no tasks/ at all → no children, no crash
+  await writeTicket('in-progress', 'EPIC-EMPTY', { 'prd.md': spec({ title: 'Empty epic', kind: 'epic', status: 'in-progress' }) })
   // unknown dir (no spec, no prd) → skipped
   await fs.mkdir(join(root, 'claudedocs', 'tickets', 'backlog', 'PB-99'), { recursive: true })
   // hidden dir → skipped
@@ -157,18 +189,50 @@ afterAll(async () => {
 })
 
 describe('scanProjectRoot', () => {
-  it('surfaces exactly the seven solo tickets (skips epic/child/unknown/hidden)', () => {
+  it('surfaces the solo tickets and epic children (skips epics/no-spec/unknown/hidden)', () => {
     expect(result.error).toBeNull()
     expect(result.tickets.map((t) => t.id).sort()).toEqual([
+      // 7 solos
       'PB-10', 'PB-11', 'PB-12', 'PB-13', 'PB-14', 'PB-15', 'PB-16',
+      // 4 epic children that carry a spec (PB-24 has no 01-spec.md → skipped;
+      // EPIC-1 / EPIC-EMPTY are epics → never rendered as cards)
+      'PB-20', 'PB-21', 'PB-22', 'PB-23',
     ])
   })
 
-  it('places each ticket in its folder column', () => {
+  it('places each solo ticket in its status-derived column', () => {
     expect(byId(result, 'PB-10')?.column).toBe('backlog')
     expect(byId(result, 'PB-11')?.column).toBe('in-progress')
     expect(byId(result, 'PB-12')?.column).toBe('review')
     expect(byId(result, 'PB-13')?.column).toBe('done')
+    // status-derived: PB-15 is status:done parked in in-progress/ → shows in Done
+    expect(byId(result, 'PB-15')?.column).toBe('done')
+  })
+
+  it('places epic children in status-derived columns and tags the parent epic', () => {
+    // All three live physically in backlog/EPIC-1/tasks/ but land per status.
+    expect(byId(result, 'PB-20')?.column).toBe('backlog')
+    expect(byId(result, 'PB-21')?.column).toBe('in-progress')
+    expect(byId(result, 'PB-22')?.column).toBe('done')
+    expect(byId(result, 'PB-20')?.parentEpicId).toBe('EPIC-1')
+    expect(byId(result, 'PB-22')?.parentEpicId).toBe('EPIC-1')
+    // child stage still derives from its own artifacts
+    expect(byId(result, 'PB-22')?.derivedStage).toBe('plan')
+  })
+
+  it('degrades a child with unparseable frontmatter into Backlog, never dropping it', () => {
+    const degraded = byId(result, 'PB-23')
+    expect(degraded?.metadataError).toBe(true)
+    expect(degraded?.status).toBeNull()
+    expect(degraded?.column).toBe('backlog')
+    expect(degraded?.parentEpicId).toBe('EPIC-1')
+    expect(degraded?.staleFolder).toBe(false)
+  })
+
+  it('does not surface a child without 01-spec.md, a nested epic, or the epics themselves', () => {
+    expect(byId(result, 'PB-24')).toBeUndefined() // nested epic / no spec
+    expect(byId(result, 'EPIC-1')).toBeUndefined()
+    expect(byId(result, 'EPIC-EMPTY')).toBeUndefined() // malformed epic (no tasks/) — no crash
   })
 
   it('derives the pipeline stage from artifacts present', () => {
@@ -177,16 +241,20 @@ describe('scanProjectRoot', () => {
     expect(byId(result, 'PB-10')?.derivedStage).toBe('spec')
   })
 
-  it('flags a status/folder mismatch', () => {
-    expect(byId(result, 'PB-15')?.mismatch).toBe(true)
-    expect(byId(result, 'PB-11')?.mismatch).toBe(false)
+  it('flags a stale folder on a solo, and suppresses it for epic children', () => {
+    expect(byId(result, 'PB-15')?.staleFolder).toBe(true) // status done, parked in in-progress/
+    expect(byId(result, 'PB-11')?.staleFolder).toBe(false)
+    // PB-22 is status:done physically in backlog/EPIC-1/tasks/ — divergence is by
+    // design for a child, so the stale-folder flag is suppressed.
+    expect(byId(result, 'PB-22')?.staleFolder).toBe(false)
   })
 
-  it('renders a degraded card with the folder name as id', () => {
+  it('renders a degraded solo at its physical folder with the folder name as id', () => {
     const degraded = byId(result, 'PB-16')
     expect(degraded?.metadataError).toBe(true)
     expect(degraded?.title).toBe('PB-16')
-    expect(degraded?.column).toBe('in-progress')
+    expect(degraded?.column).toBe('in-progress') // degraded solo falls back to its real folder
+    expect(degraded?.parentEpicId).toBeUndefined()
   })
 
   it('lists artifacts present (incl. 01-spec) sorted', () => {
@@ -217,6 +285,20 @@ describe('getArtifactFromRoot', () => {
   it('returns not-found for a missing artifact', async () => {
     const res = await getArtifactFromRoot({ name: 'fix', path: root }, 'PB-10', '06-summary.md')
     expect(res.found).toBe(false)
+  })
+  it('reads a nested epic child artifact via parentEpicId', async () => {
+    const res = await getArtifactFromRoot({ name: 'fix', path: root }, 'PB-22', '02-plan.md', 'EPIC-1')
+    expect(res.found).toBe(true)
+    expect(res.content).toContain('# p')
+  })
+  it('does not find a child artifact without parentEpicId (flat lookup misses the nested path)', async () => {
+    const res = await getArtifactFromRoot({ name: 'fix', path: root }, 'PB-22', '02-plan.md')
+    expect(res.found).toBe(false)
+  })
+  it('rejects a traversal parentEpicId', async () => {
+    const res = await getArtifactFromRoot({ name: 'fix', path: root }, 'PB-22', '02-plan.md', '../../etc')
+    expect(res.found).toBe(false)
+    expect(res.error).toMatch(/Invalid/)
   })
   it('rejects a disallowed / traversal filename', async () => {
     const res = await getArtifactFromRoot({ name: 'fix', path: root }, 'PB-10', '../../../etc/passwd')

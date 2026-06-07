@@ -61,15 +61,31 @@ export interface TicketDTO {
   complexity: Complexity | null
   /** Frontmatter status; null when unparseable. Drives the badge only. */
   status: TicketStatus | null
-  /** Physical folder — determines the column the card appears in. */
+  /**
+   * Status-derived column the card appears in (via expectedFolderForStatus).
+   * The physical folder is informational; for an out-of-sync ticket the two
+   * diverge and `staleFolder` is set. A degraded solo falls back to its physical
+   * folder; a degraded child falls back to `backlog`.
+   */
   column: Column
   derivedStage: DerivedStage
   projectName: string
   tags: string[]
+  /**
+   * For an epic child task, the parent epic's id (folder name). Absent for solo
+   * tickets. Distinguishes a child card, namespaces its React key, and lets the
+   * detail panel rebuild the nested artifact path.
+   */
+  parentEpicId?: string
   /** Artifact filenames present in the ticket folder, e.g. ['01-spec.md','02-plan.md']. */
   artifacts: string[]
-  /** True when frontmatter status maps to a different folder than where the ticket sits. */
-  mismatch: boolean
+  /**
+   * True when the ticket's physical folder ≠ its status-derived column — i.e. the
+   * card is shown somewhere other than the folder it physically sits in. Always
+   * false for epic children (their folder is the epic's by design) and for
+   * degraded cards (null status).
+   */
+  staleFolder: boolean
   /** True when frontmatter was missing/unparseable and this is a degraded card. */
   metadataError: boolean
 }

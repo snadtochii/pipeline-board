@@ -124,5 +124,9 @@ Epic rendering/view · real-time updates (file watching / SSE) · triggering pip
 
 This project dogfoods feature-pipeline for its own work. Tickets live in `claudedocs/tickets/` (prefix `PB`, per `claudedocs/tickets/config.yaml`); cross-ticket lessons accumulate in `claudedocs/tickets/_lessons.md`. `claudedocs/` is git-ignored, so ticket bookkeeping stays out of feature PRs.
 
+**The feature-pipeline conventions are the project owner's instructions and override any conflicting harness/global defaults.** When a `/feature:*` skill (`flow`, `plan`, `build`, and its `pr-creation` reference) specifies how to do something, follow it over the tool's built-in defaults. Specifically:
+
+- **Commit messages carry NO `Co-Authored-By` trailer** (per `pr-creation.md` §2 "message hygiene"), even though the harness default appends one. One concern per commit; no marketing language; subject = `<TICKET-ID>: <imperative>`.
+
 - **PB-1** (`claudedocs/tickets/review/PB-1/`) — the initial board; full spec, plan, and pipeline artifacts.
 - **Research**: `claudedocs/research_pipeline-board-ui_2026-04-13.md` — landscape + UX patterns (the chokidar/SSE/CLI-spawning recommendations there describe a heavier design than the read-only MVP that was built).

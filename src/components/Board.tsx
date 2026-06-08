@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { listProjects, scanAll } from '../server/functions'
 import { POLL_INTERVAL_MS, PRIORITY_RANK, queryKeys } from '../lib/query'
+import { loadCollapsedColumns, saveCollapsedColumns } from '../lib/collapsed-columns'
 import { STATE_FOLDERS } from '../server/types'
 import type { Column as Col, ProjectScanResult, TicketDTO } from '../server/types'
 import { Column } from './Column'
@@ -34,6 +35,34 @@ export function Board() {
   const [filter, setFilter] = useState<string>('all') // 'all' | project name
   const [selected, setSelected] = useState<TicketDTO | null>(null)
   const [manageOpen, setManageOpen] = useState(false)
+  // Collapsed columns. Starts empty (all expanded) so the first render matches
+  // the server — the persisted set is read in a mount effect, never during
+  // render, to avoid an SSR hydration mismatch.
+  const [collapsed, setCollapsed] = useState<Set<Col>>(() => new Set())
+
+  // Hydrate collapse state from localStorage after mount (client-only).
+  useEffect(() => {
+    const stored = loadCollapsedColumns()
+    if (stored.length > 0) {
+      setCollapsed(new Set(stored))
+    }
+  }, [])
+
+  // Toggle a column and write through to localStorage. Persisting here (not in a
+  // useEffect on `collapsed`) avoids clobbering the stored value with the empty
+  // initial set before the mount hydration runs.
+  const toggleCollapse = useCallback((col: Col) => {
+    setCollapsed((prev) => {
+      const next = new Set(prev)
+      if (next.has(col)) {
+        next.delete(col)
+      } else {
+        next.add(col)
+      }
+      saveCollapsedColumns([...next])
+      return next
+    })
+  }, [])
 
   const results: ProjectScanResult[] = scan.data ?? []
   const projects = projectsQ.data ?? []
@@ -156,6 +185,8 @@ export function Board() {
                 tickets={byColumn[col]}
                 showProject={showProject}
                 onSelect={setSelected}
+                collapsed={collapsed.has(col)}
+                onToggleCollapse={toggleCollapse}
               />
             ))}
           </div>

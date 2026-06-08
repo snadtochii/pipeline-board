@@ -103,3 +103,47 @@ export interface ArtifactResult {
   content: string | null
   error?: string
 }
+
+// ── Cross-workspace sync (PB-6) ──────────────────────────────────────────────
+// Status of a board-triggered `/feature:sync` sweep across every configured
+// workspace. Persisted (atomically) to ~/.pipeline-board/last-sync.json by the
+// orchestrator and read back by the getSyncStatus server fn — it is app status,
+// not ticket data, so it never travels through the TicketSource seam.
+
+/** Overall run state. `running` older than the staleness threshold reads as `failed`. */
+export type SyncRunState = 'running' | 'done' | 'failed'
+
+/** Per-workspace state as the sweep advances (boundary-written, one at a time). */
+export type SyncWorkspaceState = 'pending' | 'running' | 'done' | 'failed'
+
+/** Counts parsed (best-effort) from one workspace's grouped sync report. */
+export interface SyncOutcome {
+  promoted: number
+  open: number
+  needsAttention: number
+  couldntCheck: number
+}
+
+export interface SyncWorkspaceStatus {
+  /** Mirrors Project{name,path} so the UI correlates with scanAll without a join. */
+  name: string
+  path: string
+  state: SyncWorkspaceState
+  /** ISO timestamps; null until the workspace starts / finishes. */
+  startedAt: string | null
+  finishedAt: string | null
+  /** Parsed counts, or null when the report couldn't be parsed / run didn't finish. */
+  outcome: SyncOutcome | null
+  /** Failure reason when state is `failed` (missing dir, spawn error, non-zero exit, timeout). */
+  error?: string
+  /** Raw report tail kept as a fallback when parsing fails. */
+  rawReport?: string
+}
+
+export interface SyncRunStatus {
+  runId: string
+  startedAt: string
+  finishedAt: string | null
+  status: SyncRunState
+  workspaces: SyncWorkspaceStatus[]
+}

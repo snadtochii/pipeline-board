@@ -8,7 +8,7 @@ import type { Project } from './types'
 // any project tree (and out of the git-ignored claudedocs/). All ticket state
 // is still derived from the filesystem; nothing about tickets is persisted here.
 
-function configDir(): string {
+export function configDir(): string {
   return process.env.PIPELINE_BOARD_CONFIG_DIR ?? join(homedir(), '.pipeline-board')
 }
 

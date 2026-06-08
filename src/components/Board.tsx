@@ -7,6 +7,7 @@ import { STATE_FOLDERS } from '../server/types'
 import type { Column as Col, ProjectScanResult, TicketDTO } from '../server/types'
 import { Column } from './Column'
 import { ProjectFilter } from './ProjectFilter'
+import { SyncControl } from './SyncControl'
 import { AddProjectDialog } from './AddProjectDialog'
 import { DetailPanel } from './DetailPanel'
 import { ProjectErrorChip } from './ProjectErrorChip'
@@ -135,6 +136,7 @@ export function Board() {
           <button type="button" onClick={() => setManageOpen(true)}>
             Manage projects
           </button>
+          <SyncControl />
           <button
             type="button"
             className={`refresh${scan.isFetching ? ' is-busy' : ''}`}

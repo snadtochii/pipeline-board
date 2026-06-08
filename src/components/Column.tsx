@@ -13,19 +13,37 @@ export function Column({
   tickets,
   showProject,
   onSelect,
+  collapsed,
+  onToggleCollapse,
 }: {
   column: Col
   tickets: TicketDTO[]
   showProject: boolean
   onSelect: (t: TicketDTO) => void
+  collapsed: boolean
+  onToggleCollapse: (col: Col) => void
 }) {
+  const title = COLUMN_TITLES[column]
+  const bodyId = `col-body-${column}`
   return (
-    <section className="column" aria-label={COLUMN_TITLES[column]}>
+    <section className={`column${collapsed ? ' collapsed' : ''}`} aria-label={title}>
       <header className="col-head">
-        <span className="col-title">{COLUMN_TITLES[column]}</span>
-        <span className="col-count">{tickets.length}</span>
+        <button
+          type="button"
+          className="col-toggle"
+          aria-expanded={!collapsed}
+          aria-controls={bodyId}
+          aria-label={`${collapsed ? 'Expand' : 'Collapse'} ${title} column`}
+          onClick={() => onToggleCollapse(column)}
+        >
+          <span className="col-title">{title}</span>
+          <span className="col-count">{tickets.length}</span>
+          <span className="col-chevron" aria-hidden="true">
+            {collapsed ? '▸' : '▾'}
+          </span>
+        </button>
       </header>
-      <div className="col-body">
+      <div className="col-body" id={bodyId} hidden={collapsed}>
         {tickets.length === 0 ? (
           <p className="col-empty">No tickets</p>
         ) : (

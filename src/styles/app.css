@@ -158,11 +158,14 @@ button.refresh svg {
 }
 
 /* ---- board ---- */
+/* Flex (not grid) so a collapsed column can animate its width: flex-basis /
+   min-width interpolate under a transition, whereas grid track types
+   (44px <-> minmax(220px,1fr)) do not. Expanded columns share the row equally
+   from a 220px basis, matching the prior repeat(4, minmax(220px,1fr)) feel. */
 .board {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(220px, 1fr));
+  display: flex;
   gap: 14px;
-  align-items: start;
+  align-items: flex-start;
 }
 .column {
   background: var(--panel);
@@ -171,18 +174,34 @@ button.refresh svg {
   display: flex;
   flex-direction: column;
   min-height: 120px;
+  flex: 1 1 220px;
+  min-width: 220px;
 }
 .col-head {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 10px 12px;
+  align-items: stretch;
   border-bottom: 1px solid var(--border);
   position: sticky;
   top: 0;
 }
+/* The whole header is one button — so the collapsed rail is fully clickable.
+   Padding lives here (not on .col-head) so it's part of the hit target. */
+.col-toggle {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  background: transparent;
+  border: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
 .col-title {
   font-weight: 600;
+  flex: 1; /* push count + chevron to the right when expanded */
 }
 .col-count {
   color: var(--muted);
@@ -191,16 +210,60 @@ button.refresh svg {
   padding: 0 8px;
   font-size: 12px;
 }
+.col-chevron {
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1;
+}
 .col-body {
   display: flex;
   flex-direction: column;
   gap: 10px;
   padding: 10px;
 }
+/* .col-body sets display:flex, which would otherwise beat the UA [hidden] rule
+   (display:none) — restate it so a collapsed column's body is truly hidden. */
+.col-body[hidden] {
+  display: none;
+}
 .col-empty {
   color: var(--muted);
   font-size: 12px;
   margin: 4px 2px;
+}
+
+/* ---- collapsed column (narrow vertical rail) ---- */
+.column.collapsed {
+  flex: 0 0 44px;
+  min-width: 44px;
+  align-self: stretch; /* match the tallest expanded sibling's height */
+}
+.column.collapsed .col-head {
+  position: static; /* nothing scrolls past a full-height rail */
+  border-bottom: none;
+  height: 100%;
+}
+.column.collapsed .col-toggle {
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 10px;
+  padding: 10px 4px;
+}
+.column.collapsed .col-title {
+  flex: 0 0 auto;
+  writing-mode: vertical-rl; /* vertical title in the rail */
+}
+.column.collapsed .col-chevron {
+  order: -1; /* expand affordance at the top of the rail */
+}
+
+/* Animate the collapse/expand width change, but only when motion is welcome
+   (mirrors the refresh-spinner gating above). */
+@media (prefers-reduced-motion: no-preference) {
+  .column {
+    transition: flex-basis 0.2s ease, min-width 0.2s ease;
+  }
 }
 
 /* ---- card ---- */

@@ -40,6 +40,9 @@ const RAW_REPORT_TAIL = 2000
 /** Cap on live stdout/stderr capture so a pathologically chatty run can't balloon memory.
  *  The grouped report lives at the end, so we keep the tail. */
 const MAX_CAPTURE = 64 * 1024
+/** Default model for the spawned sync runs. Sync is mechanical (check PR → move folder →
+ *  flip frontmatter), so it doesn't need the top-tier model; the `CLAUDE_MODEL` env overrides this. */
+const DEFAULT_SYNC_MODEL = 'sonnet'
 
 /** Optional progress sink — the CLI prints from it; the server fn omits it (polls the file instead). */
 export interface SyncRunReporter {
@@ -197,10 +200,19 @@ interface SpawnResult {
   spawnError?: Error
 }
 
+/**
+ * Build the `claude -p` argument vector. The model defaults to DEFAULT_SYNC_MODEL
+ * (sync is mechanical — no need for the top-tier model); a non-empty `CLAUDE_MODEL`
+ * overrides it. Pure + exported so the default/override behavior is unit-tested
+ * without spawning.
+ */
+export function buildSyncArgs(model: string | undefined): string[] {
+  const m = model && model.trim() ? model.trim() : DEFAULT_SYNC_MODEL
+  return ['-p', '/feature:sync', '--allowedTools', ...ALLOWED_TOOLS, '--model', m]
+}
+
 function spawnSync(project: Project): Promise<SpawnResult> {
-  const args = ['-p', '/feature:sync', '--allowedTools', ...ALLOWED_TOOLS]
-  const model = process.env.CLAUDE_MODEL
-  if (model && model.trim()) args.push('--model', model.trim())
+  const args = buildSyncArgs(process.env.CLAUDE_MODEL)
 
   return new Promise<SpawnResult>((resolve) => {
     const child = spawn('claude', args, {

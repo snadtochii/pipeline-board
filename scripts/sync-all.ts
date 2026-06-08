@@ -12,7 +12,7 @@
 //
 // Usage:   npm run sync       (or: node scripts/sync-all.ts)
 // Env:     PIPELINE_BOARD_CONFIG_DIR  override the board config dir
-//          CLAUDE_MODEL               pin a model for the mechanical sync runs
+//          CLAUDE_MODEL               model for the spawned sync runs (default: sonnet)
 //
 // Requires Node >= 24 (runs the TypeScript directly via type-stripping). If your
 // Node is older, run with a TS loader, e.g. `node --import tsx scripts/sync-all.ts`.

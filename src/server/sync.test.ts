@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   SYNC_STALE_MS,
+  buildSyncArgs,
   isSyncRunning,
   parseSyncReport,
   readSyncStatus,
@@ -168,6 +169,30 @@ describe('readSyncStatus', () => {
     expect(read?.workspaces[1]?.error).toMatch(/stale/i)
     // A workspace that already finished is left untouched.
     expect(read?.workspaces[0]?.state).toBe('done')
+  })
+})
+
+describe('buildSyncArgs', () => {
+  it('defaults to sonnet when no model is given', () => {
+    const args = buildSyncArgs(undefined)
+    expect(args.slice(0, 3)).toEqual(['-p', '/feature:sync', '--allowedTools'])
+    expect(args.slice(-2)).toEqual(['--model', 'sonnet'])
+    // least-privilege allowlist is present, no bypassPermissions
+    expect(args).toContain('Bash(gh:*)')
+    expect(args).not.toContain('--dangerously-skip-permissions')
+  })
+
+  it('honors an explicit CLAUDE_MODEL override', () => {
+    expect(buildSyncArgs('haiku').slice(-2)).toEqual(['--model', 'haiku'])
+    expect(buildSyncArgs('claude-haiku-4-5-20251001').slice(-2)).toEqual([
+      '--model',
+      'claude-haiku-4-5-20251001',
+    ])
+  })
+
+  it('falls back to the default on blank/whitespace model', () => {
+    expect(buildSyncArgs('   ').slice(-2)).toEqual(['--model', 'sonnet'])
+    expect(buildSyncArgs('').slice(-2)).toEqual(['--model', 'sonnet'])
   })
 })
 

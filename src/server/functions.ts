@@ -5,7 +5,8 @@ import {
   removeProject as removeProjectConfig,
 } from './config'
 import { filesystemTicketSource, validateProjectPath } from './scanner'
-import type { ArtifactResult, Project, ProjectScanResult } from './types'
+import { readSyncStatus, startGuardedRun } from './sync'
+import type { ArtifactResult, Project, ProjectScanResult, SyncRunStatus } from './types'
 
 // NOTE: keep this module free of top-level Node-builtin imports (node:fs/os/path)
 // and free of plain (non-createServerFn) exports that use them. Client components
@@ -105,3 +106,22 @@ export const getArtifact = createServerFn({ method: 'GET' })
       data.parentEpicId,
     )
   })
+
+// ── Cross-workspace sync (PB-6) ──────────────────────────────────────────────
+// Standalone server fns (siblings to listProjects) — NEVER nested or wrapped
+// around another server fn (TanStack/router #7213). All node:fs/child_process
+// work lives in ./sync, reached only inside these handler bodies.
+
+/** Read the last/active cross-workspace sync run's status (null = never synced). */
+export const getSyncStatus = createServerFn({ method: 'GET' }).handler(
+  async (): Promise<SyncRunStatus | null> => readSyncStatus(),
+)
+
+/**
+ * Start a cross-workspace sync run. Non-blocking: guards against an active run,
+ * seeds the `running` status synchronously, then fires the (minutes-long) sweep
+ * without awaiting it. Progress flows only through last-sync.json, polled by the UI.
+ */
+export const startSync = createServerFn({ method: 'POST' }).handler(
+  async (): Promise<{ started: boolean; reason?: string }> => startGuardedRun(),
+)

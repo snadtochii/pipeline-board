@@ -9,7 +9,8 @@
     "build": "vite build",
     "start": "node .output/server/index.mjs",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "sync": "node scripts/sync-all.ts"
   },
   "dependencies": {
     "@tanstack/react-query": "5.101.0",

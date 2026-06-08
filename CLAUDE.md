@@ -8,7 +8,7 @@ Pipeline Board is a standalone local web app: a **read-only Kanban viewer** for 
 
 It is **not** part of the feature-pipeline plugin — it's a separate app that reads the plugin's file-based state. There is **no database**: the filesystem is the single source of truth, re-scanned on a short poll.
 
-> The MVP (ticket PB-1) is deliberately small: read-only, polling. It does **not** watch files, spawn CLI sessions, or trigger pipeline stages. See "Out of scope" below for what was intentionally deferred.
+> Stage 1 (PB-1) was deliberately small: read-only, polling — no file watching, no CLI spawning, no triggering pipeline stages. **Stage 2 (PB-6) adds the board's first actuator**: a header control that spawns `/feature:sync` (headless `claude -p`) across every configured workspace and shows live status. The board still never edits ticket files itself — only the spawned `/feature:sync` does. See "Cross-workspace sync" and "Out of scope" below.
 
 ## Commands
 
@@ -43,7 +43,7 @@ There is no E2E framework wired in; UI behavior is verified manually / via the f
 - **react-markdown** — in-panel artifact rendering (trusted local content; raw HTML disabled)
 - **Vitest** — unit tests for the server scanner/config logic
 
-(No chokidar, no SSE, no `child_process` — those belong to deferred features, not the current build.)
+(No chokidar, no SSE. `node:child_process` **is** now used — server-side only, in `src/server/sync.ts` — to spawn `/feature:sync` per workspace; see "Cross-workspace sync".)
 
 ## Architecture
 
@@ -52,11 +52,15 @@ Browser (React + TanStack Query, polls every 5s)
   │  server-function RPC (DTOs only — never raw fs paths/handles)
   ▼
 TanStack Start server (src/server/functions.ts)
-  │  scanAll · listProjects · addProject · removeProject · getArtifact
+  │  scanAll · listProjects · addProject · removeProject · getArtifact · startSync · getSyncStatus
   ▼
 TicketSource interface (src/server/ticket-source.ts)   ← the swap seam
   └─ FilesystemTicketSource (src/server/scanner.ts) — node:fs + gray-matter
        reads each configured project's  claudedocs/tickets/  tree
+
+  startSync / getSyncStatus delegate to src/server/sync.ts (node:child_process) —
+  spawns /feature:sync per workspace, writes ~/.pipeline-board/last-sync.json. NOT
+  a TicketSource method (sync status is app state, not ticket data).
 ```
 
 All filesystem access lives in `src/server/` and runs only inside server-function handler bodies. The client receives serialized `TicketDTO`s. A future DB / git / hosted backend implements the same `TicketSource` interface without touching the UI.
@@ -70,16 +74,19 @@ src/
 ├── routes/
 │   ├── __root.tsx        # html shell + per-request QueryClientProvider
 │   └── index.tsx         # renders <Board/>
-├── components/           # Board, Column, TicketCard, ProjectFilter, AddProjectDialog,
+├── components/           # Board, Column, TicketCard, ProjectFilter, SyncControl, AddProjectDialog,
 │                         #   DetailPanel, MarkdownView, ProjectErrorChip, EmptyState
 ├── lib/query.ts          # poll interval, query keys, priority rank
-├── server/               # SERVER-ONLY (node:fs lives here)
-│   ├── types.ts          # DTOs + enums + STATE_FOLDERS + STAGE_ARTIFACTS
+├── server/               # SERVER-ONLY (node:fs + node:child_process live here)
+│   ├── types.ts          # DTOs + enums + STATE_FOLDERS + STAGE_ARTIFACTS + Sync* status DTOs
 │   ├── ticket-source.ts  # TicketSource interface (the seam)
 │   ├── scanner.ts        # FilesystemTicketSource: scan/classify/derive/getArtifact + validateProjectPath
-│   ├── config.ts         # ~/.pipeline-board/projects.json (load/save/add/remove)
+│   ├── config.ts         # ~/.pipeline-board/projects.json (load/save/add/remove) + configDir
+│   ├── sync.ts           # cross-workspace /feature:sync orchestrator + last-sync.json (node:child_process)
 │   └── functions.ts      # createServerFn wrappers (the only module client components import)
 └── styles/app.css
+
+scripts/sync-all.ts        # thin CLI over src/server/sync.ts (npm run sync) — runs the sweep in the terminal
 ```
 
 ## The data contract it reads (feature-pipeline tickets)
@@ -106,19 +113,25 @@ Scanning is one level deep per state folder, **plus exactly one extra level into
 
 ## Configuration (the board's own)
 
-Which project folders the board shows is the board's *own* config (not ticket data), persisted to **`~/.pipeline-board/projects.json`** as `{ name, path }[]`. A "project" is any folder containing `claudedocs/tickets/`. Seed on first run with `PIPELINE_BOARD_PROJECTS="/path/a,/path/b"`; override the config dir in tests with `PIPELINE_BOARD_CONFIG_DIR`.
+Which project folders the board shows is the board's *own* config (not ticket data), persisted to **`~/.pipeline-board/projects.json`** as `{ name, path }[]`. A "project" is any folder containing `claudedocs/tickets/`. Seed on first run with `PIPELINE_BOARD_PROJECTS="/path/a,/path/b"`; override the config dir in tests with `PIPELINE_BOARD_CONFIG_DIR`. The cross-workspace sync run writes its status to **`~/.pipeline-board/last-sync.json`** (atomic temp+rename) in the same dir; the board reads it via `getSyncStatus`.
+
+## Cross-workspace sync (PB-6)
+
+A header control runs `/feature:sync` across every workspace in `projects.json`, reconciling merged GitHub PRs into each repo's `done/`. The shared orchestrator core is `src/server/sync.ts` (`runSyncAll`), consumed by two thin entry points: the `startSync` / `getSyncStatus` server fns (board trigger + live status) and a CLI (`scripts/sync-all.ts`, `npm run sync`). It spawns headless `claude -p "/feature:sync"` per workspace with a least-privilege `--allowedTools` allowlist — it does **not** reimplement sync's reconciliation logic. The run is in-process on the persistent Node server and non-blocking (the start fn guards against a concurrent run, seeds `running`, then returns immediately); progress + results are written incrementally to `last-sync.json` (atomic) and polled on the existing 5s loop. A staleness guard (`SYNC_STALE_MS`, 15m) keeps a crashed run from locking the control. Visibility, not autonomy, is the point: runs are user-initiated and watched — scheduled/background daemons are deliberately rejected.
 
 ## Key constraints & conventions
 
-- **Read-only** — never write to, move, or delete anything under a project's `claudedocs/tickets/`. The only files the app writes are its own `~/.pipeline-board/` config.
+- **Read-only on ticket files** — the app never writes to, moves, or deletes anything under a project's `claudedocs/tickets/`. The only files the app writes are its own `~/.pipeline-board/` config (`projects.json`, `last-sync.json`). **Stage-2 caveat**: the board may now *trigger* `/feature:sync` (via `claude`), which mutates ticket files — but that mutation is always the spawned skill's, never the app's own fs writes.
 - **No database** — derive everything from the filesystem each scan.
-- **Server/client boundary** — `node:fs`/`os`/`path` must stay in `src/server/` modules and be used only inside `createServerFn().handler()` bodies. `functions.ts` (the module client components import) must have **no** top-level Node-builtin imports and **no** plain (non-server-fn) exports that use them — otherwise the Node import leaks into the client bundle and crashes on hydration, which SSR and unit tests will not catch. (This is why `validateProjectPath` lives in `scanner.ts`, not `functions.ts`.) Middleware may call plain server-only helpers, but must not call another `createServerFn`.
+- **Server/client boundary** — `node:fs`/`os`/`path`/`child_process` must stay in `src/server/` modules and be used only inside `createServerFn().handler()` bodies. `functions.ts` (the module client components import) must have **no** top-level Node-builtin imports and **no** plain (non-server-fn) exports that use them — otherwise the Node import leaks into the client bundle and crashes on hydration, which SSR and unit tests will not catch. (This is why `validateProjectPath` lives in `scanner.ts` and the sync orchestrator in `sync.ts`, not `functions.ts` — `functions.ts` imports them but uses them only inside handler bodies.) Middleware may call plain server-only helpers, but must not call another `createServerFn`.
 - **TicketSource seam** — all ticket reads go through the interface so the storage backend can be swapped later.
 - **Single user, local** — no auth, no multi-user, desktop-first.
 
-## Out of scope (deferred — not built in PB-1)
+## Out of scope (still deferred)
 
-Epic rendering/view · real-time updates (file watching / SSE) · triggering pipeline stages / spawning `claude` CLI · database (SQLite/managed) · remote hosting (DigitalOcean) · ticket editing in the UI · auth · mobile-first. The `TicketSource` seam keeps the door open for the DB/git/hosted variants.
+Epic rendering/view · real-time updates (file watching / SSE) · database (SQLite/managed) · remote hosting (DigitalOcean) · ticket editing in the UI · auth · mobile-first.
+
+**Spawning `claude` is no longer wholesale out of scope** (stage 2 / PB-6): the board triggers `/feature:sync` across all configured workspaces on demand. What remains out: scheduled/background runs (launchd/cron — explicitly rejected), per-workspace/selective sync from the UI, live log streaming, and triggering *other* pipeline stages (e.g. a flow/cloud session on a status change — the future drag→flow vision). The `TicketSource` seam keeps the door open for the DB/git/hosted variants.
 
 ## This repo's own development
 

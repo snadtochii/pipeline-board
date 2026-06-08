@@ -6,6 +6,7 @@ export const POLL_INTERVAL_MS = 5000
 export const queryKeys = {
   scan: ['scan'] as const,
   projects: ['projects'] as const,
+  syncStatus: ['sync-status'] as const,
   // parentEpicId is part of the key so an epic child and a same-id solo (or a
   // child of another epic) never share a cache entry.
   artifact: (project: string, ticket: string, file: string, parentEpicId?: string) =>

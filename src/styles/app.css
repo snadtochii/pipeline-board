@@ -59,6 +59,34 @@ button.icon {
   font-size: 16px;
   padding: 2px 6px;
 }
+/* Fixed-size square icon button (keeps default button chrome). Equal width/height
+   so swapping idle <-> busy never changes the footprint -> no topbar reflow. */
+button.refresh {
+  flex: 0 0 auto;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+button.refresh svg {
+  width: 16px;
+  height: 16px;
+  display: block;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+/* Spin only while fetching, and only when the user hasn't asked to reduce motion.
+   Reduced-motion users still get the disabled/dimmed (aria-busy) state as the cue. */
+@media (prefers-reduced-motion: no-preference) {
+  button.refresh.is-busy svg {
+    animation: spin 0.8s linear infinite;
+  }
+}
 
 /* ---- layout ---- */
 .app {

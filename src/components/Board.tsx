@@ -136,7 +136,6 @@ export function Board() {
           <button type="button" onClick={() => setManageOpen(true)}>
             Manage projects
           </button>
-          <SyncControl />
           <button
             type="button"
             className={`refresh${scan.isFetching ? ' is-busy' : ''}`}
@@ -160,6 +159,7 @@ export function Board() {
               <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
             </svg>
           </button>
+          <SyncControl />
         </div>
       </header>
 

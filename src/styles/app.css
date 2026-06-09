@@ -128,7 +128,12 @@ button.refresh svg {
 
 /* ---- layout ---- */
 .app {
-  min-height: 100vh;
+  /* Definite height (not min-height) so the "main" 1fr row is capped at the
+     viewport: that lets the board (.content) and the slide-over (.detail) each
+     scroll internally instead of growing the document. With min-height the row
+     would expand to fit a tall panel/board and the whole page would scroll,
+     dragging the topbar and board out of view past the fixed panel. */
+  height: 100vh;
   display: grid;
   grid-template-columns: 1fr;
   grid-template-rows: auto auto 1fr;
@@ -136,13 +141,13 @@ button.refresh svg {
     "top"
     "errors"
     "main";
-}
-.app.with-detail {
-  grid-template-columns: 1fr minmax(380px, 460px);
-  grid-template-areas:
-    "top    top"
-    "errors errors"
-    "main   detail";
+  /* Clip the slide-over panel's off-screen (translated-out) position so the
+     closed panel never produces a horizontal scrollbar. Use `clip`, not
+     `hidden`: `overflow-x: hidden` forces `overflow-y` to compute to `auto`
+     (making .app an unwanted scroll container), whereas `clip` leaves
+     `overflow-y: visible`. The board's scroll and its sticky .col-head live in
+     .content, so .app's overflow mode doesn't affect them either way. */
+  overflow-x: clip;
 }
 .topbar {
   grid-area: top;
@@ -458,12 +463,32 @@ button.refresh svg {
 
 /* ---- detail panel ---- */
 .detail {
-  grid-area: detail;
+  grid-area: main;
+  justify-self: end;
+  align-self: stretch;
+  width: min(440px, 92vw);
+  z-index: 40;
   border-left: 1px solid var(--border);
   background: var(--panel);
+  box-shadow: -8px 0 24px rgba(0, 0, 0, 0.3);
   padding: 16px;
   overflow: auto;
-  max-height: 100vh;
+  /* Slide-over: shares the main grid cell with .content (so the board never
+     reflows), anchored right, spanning the full main row — just below the
+     topbar/errors to the viewport bottom. Hidden off-screen by default;
+     .open slides it in. Closed panel is pointer-events:none so it never
+     intercepts clicks at the right edge. */
+  transform: translateX(100%);
+  pointer-events: none;
+}
+.detail.open {
+  transform: translateX(0);
+  pointer-events: auto;
+}
+@media (prefers-reduced-motion: no-preference) {
+  .detail {
+    transition: transform 0.18s ease;
+  }
 }
 .detail-head {
   display: flex;

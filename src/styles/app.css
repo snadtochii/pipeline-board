@@ -142,9 +142,11 @@ button.refresh svg {
     "errors"
     "main";
   /* Clip the slide-over panel's off-screen (translated-out) position so the
-     closed panel never produces a horizontal scrollbar. `clip` (not `hidden`)
-     avoids establishing a scroll container that would interfere with the sticky
-     .col-head, which sticks within .content's own scrollport. */
+     closed panel never produces a horizontal scrollbar. Use `clip`, not
+     `hidden`: `overflow-x: hidden` forces `overflow-y` to compute to `auto`
+     (making .app an unwanted scroll container), whereas `clip` leaves
+     `overflow-y: visible`. The board's scroll and its sticky .col-head live in
+     .content, so .app's overflow mode doesn't affect them either way. */
   overflow-x: clip;
 }
 .topbar {

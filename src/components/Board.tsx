@@ -128,7 +128,7 @@ export function Board() {
   }
 
   return (
-    <div className={`app${selected ? ' with-detail' : ''}`}>
+    <div className="app">
       <header className="topbar">
         <h1>Pipeline Board</h1>
         <div className="actions">

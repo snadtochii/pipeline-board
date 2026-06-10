@@ -191,13 +191,18 @@ button.refresh svg {
   gap: 8px;
   padding: 8px 20px 0;
 }
+/* No TOP padding here: Chromium pins sticky children at the scroll
+   container's content-box edge, so top padding on .content would leave a
+   see-through band above the stuck .col-head where cards scroll past.
+   The board's breathing room lives on .board instead (scrolls away). */
 .content {
   grid-area: main;
-  padding: 16px 20px;
+  padding: 0 20px 16px;
   overflow: auto;
 }
 .loading {
   color: var(--muted);
+  padding-top: 16px;
 }
 
 /* ---- board ---- */
@@ -209,6 +214,7 @@ button.refresh svg {
   display: flex;
   gap: 14px;
   align-items: flex-start;
+  padding-top: 16px; /* moved off .content — see the comment there */
 }
 .column {
   background: var(--panel);
@@ -220,12 +226,22 @@ button.refresh svg {
   flex: 1 1 220px;
   min-width: 220px;
 }
+/* Sticky within .content's scrollport. The header needs its own opaque paint:
+   cards scrolling under it show through otherwise (sticky grants no implicit
+   background), and the explicit z-index layers it above the cards instead of
+   relying on DOM order. 2 is plenty — .detail (40) and the modal (50) compete
+   in .app's stacking context, which outranks anything inside .content. The
+   9px radius (column's 10px minus its 1px border) keeps the opaque fill
+   inside the column's rounded top corners. */
 .col-head {
   display: flex;
   align-items: stretch;
   border-bottom: 1px solid var(--border);
   position: sticky;
   top: 0;
+  background: var(--panel);
+  z-index: 2;
+  border-radius: 9px 9px 0 0;
 }
 /* The whole header is one button — so the collapsed rail is fully clickable.
    Padding lives here (not on .col-head) so it's part of the hit target. */
@@ -285,6 +301,9 @@ button.refresh svg {
   position: static; /* nothing scrolls past a full-height rail */
   border-bottom: none;
   height: 100%;
+  /* the full-height rail's opaque fill must follow the column's BOTTOM rounded
+     corners too, or its square corners poke past the curved border */
+  border-radius: 9px;
 }
 .column.collapsed .col-toggle {
   flex-direction: column;

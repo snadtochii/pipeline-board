@@ -485,7 +485,7 @@ button.refresh svg {
   grid-area: main;
   justify-self: end;
   align-self: stretch;
-  width: min(440px, 92vw);
+  width: min(640px, 92vw);
   z-index: 40;
   border-left: 1px solid var(--border);
   background: var(--panel);

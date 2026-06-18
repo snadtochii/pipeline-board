@@ -80,6 +80,14 @@ export interface TicketDTO {
   /** Artifact filenames present in the ticket folder, e.g. ['01-spec.md','02-plan.md']. */
   artifacts: string[]
   /**
+   * Completion timestamp (ISO 8601), used to order the Done column newest-first.
+   * Derived from `06-summary.md`'s mtime (the terminal pipeline artifact); when a
+   * Done ticket has no summary (cancelled/partial-completion/degraded) it falls back
+   * to the newest mtime among present artifacts. `null` for non-Done tickets and for
+   * genuinely date-less/degraded folders (those sort last). Not a `Date` — JSON wire.
+   */
+  completedAt: string | null
+  /**
    * True when the ticket's physical folder ≠ its status-derived column — i.e. the
    * card is shown somewhere other than the folder it physically sits in. Always
    * false for epic children (their folder is the epic's by design) and for

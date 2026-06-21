@@ -3,6 +3,7 @@ import { useQuery } from '@tanstack/react-query'
 import { listProjects, scanAll } from '../server/functions'
 import { POLL_INTERVAL_MS, queryKeys } from '../lib/query'
 import { comparatorFor } from '../lib/sort'
+import { formatVersion } from '../lib/version'
 import { loadCollapsedColumns, saveCollapsedColumns } from '../lib/collapsed-columns'
 import { STATE_FOLDERS } from '../server/types'
 import type { Column as Col, ProjectScanResult, TicketDTO } from '../server/types'
@@ -124,7 +125,10 @@ export function Board() {
   return (
     <div className="app">
       <header className="topbar">
-        <h1>Pipeline Board</h1>
+        <div className="topbar-brand">
+          <h1>Pipeline Board</h1>
+          <span className="app-version">{formatVersion(__APP_VERSION__)}</span>
+        </div>
         <div className="actions">
           <ProjectFilter projects={projects} value={filter} onChange={refreshFilter} />
           <button type="button" onClick={() => setManageOpen(true)}>

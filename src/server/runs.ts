@@ -25,12 +25,16 @@ export const RUN_STALE_MS = 45 * 60_000
 /**
  * Logical key identifying a ticket's run lineage: `Project::PARENT::CHILD` (epic
  * child) or `Project::TICKET` (solo). Used only as a JSON object-key inside
- * latest.json — never as a filename — so a project display-name containing odd
- * characters is harmless (no sanitization needed). parentEpicId is included only
- * when present, so a child and a same-leaf-id solo never share an index entry.
+ * latest.json — never as a filename. Each segment is percent-encoded before the
+ * `::` join, so the separator can never occur *inside* a segment: a project
+ * display-name containing `::` (names are user-supplied via addProject) can't make
+ * a solo collide with a child. parentEpicId is included only when present.
  */
 export function ticketRunKey(projectName: string, ticketId: string, parentEpicId?: string): string {
-  return [projectName, parentEpicId, ticketId].filter((s): s is string => Boolean(s)).join('::')
+  return [projectName, parentEpicId, ticketId]
+    .filter((s): s is string => Boolean(s))
+    .map(encodeURIComponent)
+    .join('::')
 }
 
 function nowIso(): string {
@@ -58,7 +62,10 @@ export function isTicketRunStatus(x: unknown): x is TicketRunStatus {
     (o.status === 'running' || o.status === 'succeeded' || o.status === 'failed') &&
     typeof o.startedAt === 'string' &&
     typeof o.updatedAt === 'string' &&
-    (o.finishedAt === null || typeof o.finishedAt === 'string')
+    (o.finishedAt === null || typeof o.finishedAt === 'string') &&
+    (o.prUrl === undefined || typeof o.prUrl === 'string') &&
+    (o.logTail === undefined || typeof o.logTail === 'string') &&
+    (o.error === undefined || typeof o.error === 'string')
   )
 }
 
@@ -113,11 +120,16 @@ interface LatestIndex {
   byTicket: Record<string, string>
 }
 
+/** Monotonic per-process counter: two concurrent writes to the SAME target file must get distinct
+ *  temp paths — a pid-only suffix collides (both rename the same temp → one throws ENOENT). */
+let tmpSeq = 0
+
 /** Atomic write (temp + rename), mirroring sync.writeStatus / config.saveProjects, so a 5s poll
- *  never reads a torn file. The temp lives in the same dir as its target, so the rename is atomic. */
+ *  never reads a torn file. The temp lives in the same dir as its target (so the rename is atomic)
+ *  and carries a unique pid+seq suffix (so concurrent same-target writes can't collide). */
 async function writeJsonAtomic(file: string, value: unknown): Promise<void> {
   await fs.mkdir(runsDir(), { recursive: true })
-  const tmp = `${file}.tmp-${process.pid}`
+  const tmp = `${file}.tmp-${process.pid}-${tmpSeq++}`
   await fs.writeFile(tmp, JSON.stringify(value, null, 2), 'utf8')
   await fs.rename(tmp, file) // atomic replace
 }
@@ -149,16 +161,35 @@ async function readLatestIndex(): Promise<LatestIndex> {
   return { byTicket: {} }
 }
 
+// Serialize the latest.json read-modify-write so concurrent writers (different tickets) don't lose
+// each other's entries to an interleaved RMW (A reads, B reads+writes, A writes stale → B dropped).
+// A single persistent Node server makes an in-process promise-chain mutex sufficient.
+let indexChain: Promise<unknown> = Promise.resolve()
+
+function updateLatestIndex(key: string, runId: string): Promise<void> {
+  const next = indexChain.then(async () => {
+    const index = await readLatestIndex()
+    index.byTicket[key] = runId
+    await writeJsonAtomic(latestFile(), index)
+  })
+  // Keep the chain alive even if one update rejects, so a single failure can't wedge the mutex.
+  indexChain = next.catch(() => {})
+  return next
+}
+
 /**
  * Persist a run's status: write the per-run file (runs/<runId>.json) atomically,
  * then upsert the latest.json index so this run becomes the ticket's latest. Run
- * file first, then index — so the index never points at a not-yet-written run.
+ * file first, then index — so the index never points at a not-yet-written run. The
+ * index upsert is serialized (updateLatestIndex), so concurrent writers for
+ * different tickets can't lose each other's entries or collide on the temp file.
  */
 export async function writeTicketRunStatus(status: TicketRunStatus): Promise<void> {
   await writeJsonAtomic(runStatusFile(status.runId), status)
-  const index = await readLatestIndex()
-  index.byTicket[ticketRunKey(status.projectName, status.ticketId, status.parentEpicId)] = status.runId
-  await writeJsonAtomic(latestFile(), index)
+  await updateLatestIndex(
+    ticketRunKey(status.projectName, status.ticketId, status.parentEpicId),
+    status.runId,
+  )
 }
 
 /**

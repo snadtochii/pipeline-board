@@ -46,16 +46,22 @@ function freshRunningRun(overrides: Partial<TicketRunStatus> = {}): TicketRunSta
 }
 
 describe('ticketRunKey', () => {
-  it('builds a solo key without a parent segment', () => {
-    expect(ticketRunKey('Pipeline Board', 'PB-12')).toBe('Pipeline Board::PB-12')
+  it('builds a solo key without a parent segment (segments percent-encoded)', () => {
+    expect(ticketRunKey('Pipeline Board', 'PB-12')).toBe('Pipeline%20Board::PB-12')
   })
 
   it('includes the parent epic segment for a child', () => {
-    expect(ticketRunKey('Pipeline Board', 'PB-12', 'PB-11')).toBe('Pipeline Board::PB-11::PB-12')
+    expect(ticketRunKey('Pipeline Board', 'PB-12', 'PB-11')).toBe('Pipeline%20Board::PB-11::PB-12')
   })
 
   it('distinguishes a child from a same-leaf-id solo', () => {
     expect(ticketRunKey('P', 'PB-12', 'PB-11')).not.toBe(ticketRunKey('P', 'PB-12'))
+  })
+
+  it('does not collide when a project name contains the separator', () => {
+    // 'A::B' + 'X' must not equal 'A' + parent 'B' + 'X' — encoding the segments
+    // keeps the '::' separator unambiguous.
+    expect(ticketRunKey('A::B', 'X')).not.toBe(ticketRunKey('A', 'X', 'B'))
   })
 })
 
@@ -84,6 +90,9 @@ describe('isTicketRunStatus', () => {
     const missing: Record<string, unknown> = { ...freshRunningRun() }
     delete missing.updatedAt
     expect(isTicketRunStatus(missing)).toBe(false)
+    // non-string optional field
+    const badOptional: Record<string, unknown> = { ...freshRunningRun(), prUrl: 123 }
+    expect(isTicketRunStatus(badOptional)).toBe(false)
   })
 })
 
@@ -170,5 +179,23 @@ describe('run-status persistence', () => {
 
     const viaLatest = await readLatestTicketRun('Pipeline Board', 'PB-12')
     expect(viaLatest?.status).toBe('failed')
+  })
+
+  it('keeps a separate latest entry per distinct ticket', async () => {
+    await writeTicketRunStatus(freshRunningRun({ runId: 'run-1', ticketId: 'PB-1' }))
+    await writeTicketRunStatus(freshRunningRun({ runId: 'run-2', ticketId: 'PB-2' }))
+    expect((await readLatestTicketRun('Pipeline Board', 'PB-1'))?.runId).toBe('run-1')
+    expect((await readLatestTicketRun('Pipeline Board', 'PB-2'))?.runId).toBe('run-2')
+  })
+
+  it('survives concurrent writers for different tickets (no lost entry, no rename collision)', async () => {
+    await Promise.all([
+      writeTicketRunStatus(freshRunningRun({ runId: 'run-c1', ticketId: 'PB-1' })),
+      writeTicketRunStatus(freshRunningRun({ runId: 'run-c2', ticketId: 'PB-2' })),
+      writeTicketRunStatus(freshRunningRun({ runId: 'run-c3', ticketId: 'PB-3' })),
+    ])
+    expect((await readLatestTicketRun('Pipeline Board', 'PB-1'))?.runId).toBe('run-c1')
+    expect((await readLatestTicketRun('Pipeline Board', 'PB-2'))?.runId).toBe('run-c2')
+    expect((await readLatestTicketRun('Pipeline Board', 'PB-3'))?.runId).toBe('run-c3')
   })
 })

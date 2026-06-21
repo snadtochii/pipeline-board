@@ -24,7 +24,7 @@ export function EmptyState({
       <h2>No tickets to show</h2>
       <p>
         Your configured projects have no tickets in this view. Create one with{' '}
-        <code>/feature:discover</code> in Claude Code, then hit Refresh.
+        <code>/feature:discover</code> in Claude Code — it'll appear here automatically.
       </p>
     </div>
   )

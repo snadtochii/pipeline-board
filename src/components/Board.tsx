@@ -134,29 +134,6 @@ export function Board() {
           <button type="button" onClick={() => setManageOpen(true)}>
             Manage projects
           </button>
-          <button
-            type="button"
-            className={`refresh${scan.isFetching ? ' is-busy' : ''}`}
-            onClick={() => void scan.refetch()}
-            disabled={scan.isFetching}
-            aria-label="Refresh"
-            aria-busy={scan.isFetching}
-            title="Refresh"
-          >
-            <svg
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              aria-hidden="true"
-            >
-              <polyline points="23 4 23 10 17 10" />
-              <polyline points="1 20 1 14 7 14" />
-              <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
-            </svg>
-          </button>
           <SyncControl />
         </div>
       </header>

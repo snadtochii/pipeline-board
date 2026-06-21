@@ -98,7 +98,13 @@ export function isAllowedArtifactName(name: string): boolean {
   return isArtifactName(name) || name === 'prd.md'
 }
 
-function isSafeSegment(seg: string): boolean {
+/**
+ * A path segment safe to interpolate into a filesystem path (non-empty, no `/`,
+ * `\`, `..`, and not absolute). Exported so the runner's server fns can re-use the
+ * same defense-in-depth guard on client-supplied `ticketId`/`parentEpicId` before
+ * those reach a run key or a future spawned command (PB-13/PB-15 boundary).
+ */
+export function isSafeSegment(seg: string): boolean {
   return (
     seg.length > 0 &&
     !seg.includes('/') &&
@@ -398,6 +404,41 @@ export async function getArtifactFromRoot(
     }
   }
   return { found: false, content: null, error: 'Artifact not found' }
+}
+
+/**
+ * True when a ticket folder exists for `ticketId` in any of the four state
+ * folders. Solo: `<state>/<ticketId>/`. Epic child (parentEpicId given):
+ * `<state>/<parentEpicId>/tasks/<ticketId>/`. Mirrors getArtifactFromRoot's
+ * state-folder sweep + isInside defense-in-depth, but stats the ticket *directory*
+ * (a boolean) rather than reading an artifact file. Used by the runner's
+ * startTicketRun handler to reject a missing ticket before recording a run.
+ * Never throws — an unsafe segment, a vanished/unreadable entry, or a same-named
+ * file (not a directory) all read as "not found".
+ */
+export async function ticketExists(
+  project: Project,
+  ticketId: string,
+  parentEpicId?: string,
+): Promise<boolean> {
+  if (!isSafeSegment(ticketId) || (parentEpicId !== undefined && !isSafeSegment(parentEpicId))) {
+    return false
+  }
+  const ticketsRoot = join(project.path, 'claudedocs', 'tickets')
+  for (const folder of STATE_FOLDERS) {
+    const ticketDir =
+      parentEpicId !== undefined
+        ? join(ticketsRoot, folder, parentEpicId, 'tasks', ticketId)
+        : join(ticketsRoot, folder, ticketId)
+    if (!isInside(ticketsRoot, ticketDir)) continue // defense-in-depth
+    try {
+      const st = await fs.stat(ticketDir)
+      if (st.isDirectory()) return true
+    } catch {
+      // ENOENT / unreadable / vanished between calls → try the next state folder
+    }
+  }
+  return false
 }
 
 /**

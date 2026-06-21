@@ -1,7 +1,8 @@
+import { randomUUID } from 'node:crypto'
 import { promises as fs } from 'node:fs'
 import { join } from 'node:path'
 import { configDir } from './config.ts'
-import type { TicketRunAction, TicketRunStatus } from './types.ts'
+import type { Project, TicketRunAction, TicketRunStatus } from './types.ts'
 
 // Per-ticket flow runner (PB-12). SERVER-ONLY: imports node:fs/path. Reached only
 // from functions.ts handler bodies (PB-13) and tests — never from a client
@@ -39,6 +40,18 @@ export function ticketRunKey(projectName: string, ticketId: string, parentEpicId
 
 function nowIso(): string {
   return new Date().toISOString()
+}
+
+/**
+ * A unique run id used as the runs/<runId>.json filename. Timestamp for human
+ * sortability PLUS a randomUUID slice for collision resistance: unlike sync's
+ * single global sweep, two runs for *different* tickets can start in the same
+ * millisecond, and a bare timestamp would make them overwrite each other in the
+ * index (PB-12 carry-forward). The `:`/`.` of the ISO stamp are replaced so the
+ * id is path-safe.
+ */
+export function makeRunId(): string {
+  return `run-${nowIso().replace(/[:.]/g, '-')}-${randomUUID().slice(0, 8)}`
 }
 
 // ── Predicates ───────────────────────────────────────────────────────────────
@@ -233,4 +246,83 @@ export async function readLatestTicketRun(
   // so a corrupt index could hold a non-string value — keep the degrade contract airtight.
   if (typeof runId !== 'string' || !runId) return null
   return readTicketRunStatus(runId)
+}
+
+// ── Guarded start (orchestration) ─────────────────────────────────────────────
+
+export interface StartTicketRunOptions {
+  /** Whether the run requests a PR (`--pr`). Defaults to true (v1 always opens a PR). */
+  createPr?: boolean
+}
+
+export interface StartTicketRunResult {
+  started: boolean
+  /**
+   * Why a start was refused; absent on success. This helper emits only
+   * `already-running`; the startTicketRun server fn adds `unknown-project` and
+   * `ticket-not-found` from its boundary checks (shared single contract).
+   */
+  reason?: string
+  /** The persisted status on a successful start (PB-14 renders it without a second poll). */
+  status?: TicketRunStatus
+}
+
+/**
+ * Guarded, per-ticket start used by the startTicketRun server fn. In PB-13 this is
+ * a DRY RUN — no `claude` is spawned (PB-15 swaps in the real spawn behind an env
+ * gate without changing this contract).
+ *
+ * Modeled on sync's startGuardedRun: read the ticket's latest run → if it's still
+ * `running`, refuse with `already-running` → else seed+persist a `running` status
+ * synchronously (so an immediate re-poll observes the lock) → then finish it as
+ * `succeeded` with a dry-run log note and persist the terminal status. Both writes
+ * complete before returning, so the dry run is terminal-on-return.
+ *
+ * KNOWN LIMITATION (accepted for PB-13): the read-then-seed guard has a small
+ * TOCTOU window — two near-simultaneous starts for the same ticket could both pass
+ * the running-check before either seeds. Acceptable for a single-user, local,
+ * user-initiated dry run; the real per-project spawn lock is a PB-15 concern.
+ *
+ * Validation (input shape, ticket-id regex, safe-segment, project/ticket
+ * existence) belongs to the server fn boundary, NOT here — this helper stays pure
+ * and unit-testable without the Start runtime.
+ */
+export async function startGuardedTicketRun(
+  project: Project,
+  ticketId: string,
+  parentEpicId?: string,
+  options?: StartTicketRunOptions,
+): Promise<StartTicketRunResult> {
+  const current = await readLatestTicketRun(project.name, ticketId, parentEpicId)
+  if (isTicketRunRunning(current)) return { started: false, reason: 'already-running' }
+
+  const startedAt = nowIso()
+  const seed: TicketRunStatus = {
+    runId: makeRunId(),
+    projectName: project.name,
+    // Include parentEpicId only when present, so the on-disk status mirrors
+    // ticketRunKey's conditional-segment contract (a child and a same-leaf solo
+    // never collide in the index).
+    ...(parentEpicId !== undefined ? { parentEpicId } : {}),
+    ticketId,
+    action: 'flow' as TicketRunAction,
+    dryRun: true, // PB-13 is always a dry run; PB-15's env gate owns real/dry
+    createPr: options?.createPr ?? true,
+    status: 'running',
+    startedAt,
+    updatedAt: startedAt,
+    finishedAt: null,
+  }
+  await writeTicketRunStatus(seed) // synchronous lock: 'running' on disk before we finish
+
+  const finished: TicketRunStatus = {
+    ...seed,
+    status: 'succeeded',
+    updatedAt: nowIso(),
+    finishedAt: nowIso(),
+    logTail: 'dry run — no agent spawned',
+  }
+  await writeTicketRunStatus(finished)
+
+  return { started: true, status: finished }
 }

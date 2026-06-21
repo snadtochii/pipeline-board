@@ -169,6 +169,14 @@ export interface SyncRunStatus {
 /** The pipeline action a run drives. Single-valued in v1; widens when Prepare/Review-PR land. */
 export type TicketRunAction = 'flow'
 
+/**
+ * Strict ticket/epic id shape (e.g. `PB-15`). Canonical single source — `functions.ts` uses it as the
+ * server-fn validator's id gate, `runs.ts` as the defense-in-depth gate before interpolating an id into
+ * the spawned `/feature:flow <id>` command, and the client (PB-14) to gate the run control off for
+ * degraded cards. Lives here (a Node-builtin-free module both server and client safely import) so the
+ * regex is declared once — no runs↔functions import cycle and no byte-identical clone to drift. */
+export const TICKET_ID_RE = /^[A-Z][A-Z0-9]+-\d+$/
+
 /** Overall run state. A `running` older than the staleness threshold reads as `failed`. */
 export type TicketRunState = 'running' | 'succeeded' | 'failed'
 

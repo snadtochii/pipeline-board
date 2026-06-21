@@ -1,14 +1,17 @@
+import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { promises as fs } from 'node:fs'
 import { join } from 'node:path'
 import { configDir } from './config.ts'
+import { isSafeSegment } from './scanner.ts'
+import { TICKET_ID_RE } from './types.ts'
 import type { Project, TicketRunAction, TicketRunStatus } from './types.ts'
 
-// Per-ticket flow runner (PB-12). SERVER-ONLY: imports node:fs/path. Reached only
-// from functions.ts handler bodies (PB-13) and tests — never from a client
-// component (PB-1 client-bundle boundary). It persists board-owned run state under
-// ~/.pipeline-board/runs/; it never writes ticket files (only a spawned flow does,
-// from PB-15).
+// Per-ticket flow runner (PB-12/PB-13/PB-15). SERVER-ONLY: imports node:fs/path and
+// (PB-15) node:child_process. Reached only from functions.ts handler bodies (PB-13)
+// and tests — never from a client component (PB-1 client-bundle boundary). It
+// persists board-owned run state under ~/.pipeline-board/runs/; it never writes
+// ticket files itself — only the spawned /feature:flow (PB-15, env-gated) does.
 //
 // Two-file model: one runs/<runId>.json per run (history accumulates — no retention
 // in v1) plus an atomic runs/latest.json index mapping ticketRunKey → runId, so the
@@ -18,8 +21,68 @@ import type { Project, TicketRunAction, TicketRunStatus } from './types.ts'
 // which is why the DTO carries updatedAt (sync leans on per-workspace stamps instead).
 
 /** A `running` run with no activity newer than this reads as `failed` (so the control never locks).
- *  Sized generously for a long /feature:flow (plan+build+test) — ~3× sync's 15m; PB-15 confirms/tunes. */
+ *  Sized generously for a long /feature:flow (plan+build+test) — ~3× sync's 15m. */
 export const RUN_STALE_MS = 45 * 60_000
+
+/** Per-spawn `claude` kill cap (SIGTERM). Sized for a full plan+build+test+PR flow — much larger
+ *  than sync's mechanical 10m. Deliberately `< RUN_STALE_MS` so the spawn-level timeout fires
+ *  *before* the staleness backstop: a genuinely-hung child is killed and classified `failed
+ *  (timeout)` rather than left for coercion. (PB-15) */
+export const RUN_TIMEOUT_MS = 40 * 60_000
+
+/**
+ * The runner's OWN least-privilege allowlist for the spawned `/feature:flow --pr`. Broader than
+ * sync's (sync is mechanical) because flow runs plan + build: writes ticket artifacts, MOVES the
+ * ticket folder between state dirs at each transition, runs the project's validation
+ * (typecheck/test/build via npm), spawns reviewer/ui-tester subagents (Task), invokes plan/build
+ * (Skill), and opens a PR (git/gh). Resolved against the current flow + build SKILL.md
+ * `allowed-tools`, build/references/pr-creation.md, and flow/references/state-transitions.md (2026-06-21):
+ *   - flow needs:  Read, Glob, Grep, TodoWrite, Skill
+ *   - build needs: Read, Write, Edit, Glob, Grep, Bash, Task, TodoWrite
+ *   - state transitions: Bash(mv:*) — every transition does a plain `mv` of the ticket folder
+ *     between backlog/in-progress/review/done. Because `claudedocs/` is git-ignored in this repo
+ *     (and typically in the consumer), `git mv` refuses the ignored path, so the move is plain `mv`.
+ *     Sync grants `Bash(mv:*)` for the same reason. WITHOUT this, the first folder move under
+ *     headless `claude -p` (no TTY, no `--dangerously-skip-permissions`) is denied and the run stalls.
+ *   - pr-creation: Bash(git:*) (fetch/checkout/stash/commit/push), Bash(gh:*) (auth/pr create/view/list),
+ *                  Bash(command:*) (`command -v gh`)
+ *   - this repo's validation: npm run typecheck / npm test / npm run build → Bash(npm:*)
+ * Bash is SCOPED (git/gh/npm/mv/command), never unscoped — least privilege on the riskiest surface.
+ * `AskUserQuestion` is deliberately OMITTED: headless `-p` has no TTY, so a nested interactive branch
+ * (e.g. pr-creation's detached-HEAD prompt) fails fast → `failed`, rather than hanging to the timeout.
+ * NEVER emit `--dangerously-skip-permissions`.
+ */
+export const ALLOWED_TOOLS = [
+  'Read',
+  'Write',
+  'Edit',
+  'Glob',
+  'Grep',
+  'TodoWrite',
+  'Task',
+  'Skill',
+  'Bash(git:*)',
+  'Bash(gh:*)',
+  'Bash(npm:*)',
+  'Bash(mv:*)',
+  'Bash(command:*)',
+] as const
+
+/** Default model for the spawned flow run. Unlike sync (mechanical → Sonnet), flow does design-heavy
+ *  plan + build reasoning, so it defaults to a capable tier; `CLAUDE_MODEL` overrides it. (PB-15) */
+const DEFAULT_FLOW_MODEL = 'opus'
+
+/** Cap on captured stdout/stderr so a chatty flow can't balloon memory; the report tail is what matters. */
+const MAX_CAPTURE = 64 * 1024
+/** How much of a run's output to retain in logTail (parse-failure fallback + general visibility). */
+const RAW_REPORT_TAIL = 2000
+
+// TICKET_ID_RE (the strict id gate used in buildFlowArgs before interpolation) is the canonical copy
+// imported from ./types.ts — declared once there so functions.ts, runs.ts, and the client share it.
+
+function tail(text: string, n = RAW_REPORT_TAIL): string {
+  return text.length > n ? text.slice(-n) : text
+}
 
 // ── Keys & timestamps ────────────────────────────────────────────────────────
 
@@ -248,6 +311,121 @@ export async function readLatestTicketRun(
   return readTicketRunStatus(runId)
 }
 
+/**
+ * Find an active *real* (live, non-dry, non-stale) flow run anywhere in a project — the substrate for
+ * PB-15's per-project lock (before worktrees, two real flows in the same repo would race). The
+ * per-ticket `latest.json` index is keyed `Project::PARENT::CHILD` with percent-encoded segments, so
+ * the project name is the first `::`-segment: a key belongs to this project iff it starts with
+ * `encodeURIComponent(projectName) + '::'` (the `::` separator can never occur inside an encoded
+ * segment, so the prefix test is exact). Each candidate runId is resolved via readTicketRunStatus,
+ * which coerces a stale `running` to `failed` for free — so a crashed run never wedges the project
+ * lock. Only `running && dryRun === false` runs count (dry runs are instantaneous + side-effect-free,
+ * so they take only the per-ticket guard). Returns the first such run, or null.
+ *
+ * Reads the compact index once + one status file per project ticket (latest-only, not full history),
+ * and only on a live start — the default dry-run path never calls this, so it adds zero I/O over PB-13.
+ */
+async function findActiveRealRunForProject(projectName: string): Promise<TicketRunStatus | null> {
+  const index = await readLatestIndex()
+  const prefix = `${encodeURIComponent(projectName)}::`
+  for (const [key, runId] of Object.entries(index.byTicket)) {
+    if (!key.startsWith(prefix)) continue
+    if (typeof runId !== 'string' || !runId) continue // corrupt-index degrade contract
+    const status = await readTicketRunStatus(runId)
+    if (isTicketRunRunning(status) && status?.dryRun === false) return status
+  }
+  return null
+}
+
+// ── Flow adapter (build args · report parse · spawn) ──────────────────────────
+// SERVER-ONLY spawn machinery, cloned from sync.ts's buildSyncArgs/spawnSync/
+// parseSyncReport. Reached only from startGuardedTicketRun (a handler-body export),
+// never from the client bundle.
+
+/**
+ * Build the `claude -p` argument vector for a real `/feature:flow <id> [--pr]` run. Pure +
+ * exported so the vector shape (allowlist, model, --pr, no `--dangerously-skip-permissions`) is
+ * unit-tested WITHOUT spawning. Mirrors sync.ts buildSyncArgs.
+ *
+ * `ticketId` is rejected (throws — no args produced) if it fails the safe-segment + strict
+ * `TICKET_ID_RE` guard, BEFORE it can be interpolated into the slash command. This is
+ * defense-in-depth on top of the startTicketRun server-fn validator's regex gate.
+ * The model defaults to DEFAULT_FLOW_MODEL; a non-empty `options.model` (the caller passes
+ * `process.env.CLAUDE_MODEL`) overrides it.
+ */
+export function buildFlowArgs(
+  ticketId: string,
+  options?: { createPr?: boolean; model?: string },
+): string[] {
+  if (!isSafeSegment(ticketId) || !TICKET_ID_RE.test(ticketId)) {
+    throw new Error(`Unsafe or invalid ticketId for flow command: ${ticketId}`)
+  }
+  const createPr = options?.createPr ?? true
+  const command = `/feature:flow ${ticketId}${createPr ? ' --pr' : ''}`
+  const m = options?.model && options.model.trim() ? options.model.trim() : DEFAULT_FLOW_MODEL
+  return ['-p', command, '--allowedTools', ...ALLOWED_TOOLS, '--model', m]
+}
+
+/**
+ * Best-effort parse of a GitHub PR URL from flow/build's report (build's pr-creation.md prints
+ * `✅ PR opened: <url>`). Returns the first match, or null when none is present (a `--pr` run that
+ * degraded to a local commit is a legitimate no-URL success — the caller keeps the raw tail in
+ * logTail as the fallback). Pure + exported, unit-tested. Mirrors sync.ts parseSyncReport's
+ * null-on-no-match contract.
+ */
+export function parseFlowReport(text: string): string | null {
+  if (!text) return null
+  const m = text.match(/https:\/\/github\.com\/[^\s/]+\/[^\s/]+\/pull\/\d+/)
+  return m ? m[0] : null
+}
+
+interface SpawnResult {
+  code: number | null
+  signal: NodeJS.Signals | null
+  stdout: string
+  stderr: string
+  spawnError?: Error
+}
+
+/**
+ * Spawn `claude -p "/feature:flow <id> [--pr]"` in the project's cwd. Clone of sync.ts spawnSync:
+ * ignores stdin, captures stdout/stderr with a MAX_CAPTURE tail cap, NEVER throws
+ * (`child.on('error')` → `spawnError`, e.g. ENOENT when `claude` isn't on PATH), and the spawn-level
+ * `timeout` SIGTERMs a hung run. Internal — only buildFlowArgs is unit-tested; the spawn itself is
+ * exercised manually under PB-RUN-6. Inherits process.env so PATH resolves `claude` and the child
+ * sees CLAUDE_MODEL / PIPELINE_BOARD_ENABLE_RUNS.
+ */
+function spawnFlow(project: Project, ticketId: string, createPr: boolean): Promise<SpawnResult> {
+  const args = buildFlowArgs(ticketId, { createPr, model: process.env.CLAUDE_MODEL })
+
+  return new Promise<SpawnResult>((resolve) => {
+    const child = spawn('claude', args, {
+      cwd: project.path,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: RUN_TIMEOUT_MS,
+      killSignal: 'SIGTERM',
+      // env defaults to process.env so PATH is inherited and `claude` resolves.
+    })
+    let stdout = ''
+    let stderr = ''
+    child.stdout?.on('data', (d: Buffer) => {
+      stdout += d.toString()
+      if (stdout.length > MAX_CAPTURE) stdout = stdout.slice(-MAX_CAPTURE)
+    })
+    child.stderr?.on('data', (d: Buffer) => {
+      stderr += d.toString()
+      if (stderr.length > MAX_CAPTURE) stderr = stderr.slice(-MAX_CAPTURE)
+    })
+    child.on('error', (err) => {
+      // e.g. ENOENT when `claude` isn't on PATH — never throws, surfaces as a failed run.
+      resolve({ code: null, signal: null, stdout, stderr, spawnError: err })
+    })
+    child.on('close', (code, signal) => {
+      resolve({ code, signal, stdout, stderr })
+    })
+  })
+}
+
 // ── Guarded start (orchestration) ─────────────────────────────────────────────
 
 export interface StartTicketRunOptions {
@@ -268,24 +446,38 @@ export interface StartTicketRunResult {
 }
 
 /**
- * Guarded, per-ticket start used by the startTicketRun server fn. In PB-13 this is
- * a DRY RUN — no `claude` is spawned (PB-15 swaps in the real spawn behind an env
- * gate without changing this contract).
+ * True only when the server was launched with `PIPELINE_BOARD_ENABLE_RUNS=1`. STRICT exact match —
+ * any other value (unset, `'0'`, `'true'`, `'TRUE'`, `' 1 '`) reads as OFF, so accidental arming is
+ * impossible and any ambiguity fails safe to a dry run (per the spec's default-off requirement).
+ */
+function realRunsEnabled(): boolean {
+  return process.env.PIPELINE_BOARD_ENABLE_RUNS === '1'
+}
+
+/**
+ * Guarded, per-ticket start used by the startTicketRun server fn.
  *
- * Modeled on sync's startGuardedRun: read the ticket's latest run → if it's still
- * `running`, refuse with `already-running` → else seed+persist a `running` status
- * synchronously (so an immediate re-poll observes the lock) → then finish it as
- * `succeeded` with a dry-run log note and persist the terminal status. Both writes
- * complete before returning, so the dry run is terminal-on-return.
+ * DEFAULT (env gate OFF — `PIPELINE_BOARD_ENABLE_RUNS` ≠ '1'): a DRY RUN exactly as in PB-13 — no
+ * `claude` is spawned. Seed `running` (dryRun) synchronously → write `succeeded` with a log note →
+ * both writes complete before returning (terminal-on-return).
  *
- * KNOWN LIMITATION (accepted for PB-13): the read-then-seed guard has a small
- * TOCTOU window — two near-simultaneous starts for the same ticket could both pass
- * the running-check before either seeds. Acceptable for a single-user, local,
- * user-initiated dry run; the real per-project spawn lock is a PB-15 concern.
+ * LIVE (env gate ON — PB-15): seed `running` (dryRun: false) synchronously, then fire `spawnFlow`
+ * FIRE-AND-FORGET (a real flow is up to 40m — it must not be awaited; mirrors sync's startGuardedRun)
+ * and return the seeded `running` status immediately. A `runRealFlow` continuation writes the terminal
+ * status (succeeded + prUrl / failed + error) when the child closes; the board's 5s poll observes the
+ * transition. `StartTicketRunResult` shape is identical in both branches.
  *
- * Validation (input shape, ticket-id regex, safe-segment, project/ticket
- * existence) belongs to the server fn boundary, NOT here — this helper stays pure
- * and unit-testable without the Start runtime.
+ * Locks (both fs-backed guards, not input validation — they live here, not at the server-fn boundary):
+ *  - Per-ticket: refuse `already-running` if this ticket's latest run is still `running`.
+ *  - Per-project (LIVE only): refuse `project-busy` if any OTHER real flow is active in this project
+ *    (before worktrees, two real flows in one repo would race). Dry runs skip this — they're instant.
+ *
+ * KNOWN LIMITATION (carried from PB-13): the read-then-seed guard has a small TOCTOU window; the
+ * per-project check widens it slightly (project-scope vs ticket-scope). Acceptable for a single-user,
+ * local, user-initiated runner.
+ *
+ * Validation (input shape, ticket-id regex, safe-segment, project/ticket existence) belongs to the
+ * server-fn boundary, NOT here — this helper stays unit-testable without the Start runtime.
  */
 export async function startGuardedTicketRun(
   project: Project,
@@ -295,6 +487,13 @@ export async function startGuardedTicketRun(
 ): Promise<StartTicketRunResult> {
   const current = await readLatestTicketRun(project.name, ticketId, parentEpicId)
   if (isTicketRunRunning(current)) return { started: false, reason: 'already-running' }
+
+  const live = realRunsEnabled()
+  if (live) {
+    // Per-project lock applies to REAL runs only — a concurrent real flow in the same repo would race.
+    const busy = await findActiveRealRunForProject(project.name)
+    if (busy) return { started: false, reason: 'project-busy' }
+  }
 
   const startedAt = nowIso()
   const seed: TicketRunStatus = {
@@ -306,23 +505,111 @@ export async function startGuardedTicketRun(
     ...(parentEpicId !== undefined ? { parentEpicId } : {}),
     ticketId,
     action: 'flow' as TicketRunAction,
-    dryRun: true, // PB-13 is always a dry run; PB-15's env gate owns real/dry
+    dryRun: !live, // env gate owns real/dry; the seed's flag is truthful from the first write the poll sees
     createPr: options?.createPr ?? true,
     status: 'running',
     startedAt,
     updatedAt: startedAt,
     finishedAt: null,
   }
-  await writeTicketRunStatus(seed) // synchronous lock: 'running' on disk before we finish
+  await writeTicketRunStatus(seed) // synchronous lock: 'running' on disk before we return
 
-  const finished: TicketRunStatus = {
-    ...seed,
-    status: 'succeeded',
-    updatedAt: nowIso(),
-    finishedAt: nowIso(),
-    logTail: 'dry run — no agent spawned',
+  if (!live) {
+    // DRY RUN (default) — finish terminally before returning, exactly as PB-13.
+    const finished: TicketRunStatus = {
+      ...seed,
+      status: 'succeeded',
+      updatedAt: nowIso(),
+      finishedAt: nowIso(),
+      logTail: 'env gate off — dry run; no agent spawned',
+    }
+    await writeTicketRunStatus(finished)
+    return { started: true, status: finished }
   }
-  await writeTicketRunStatus(finished)
 
-  return { started: true, status: finished }
+  // LIVE — fire the long-running flow without awaiting; runRealFlow persists the terminal status.
+  void runRealFlow(seed, project).catch(() => {
+    /* runRealFlow writes its own terminal status; the staleness backstop covers a lost write */
+  })
+  return { started: true, status: seed }
+}
+
+/**
+ * Continuation for a LIVE run: pre-flight the project dir, spawn `/feature:flow`, classify the result
+ * into a terminal status, and persist it. Fire-and-forget from startGuardedTicketRun — it NEVER throws
+ * out (the terminal write is try/caught; a lost write is covered by the 45m staleness backstop). The
+ * classification mirrors sync.ts runWorkspace: spawnError → failed; code 0 → succeeded (+ parsed
+ * prUrl); code null + signal → failed (timeout/kill); else failed with the exit code.
+ */
+async function runRealFlow(seed: TicketRunStatus, project: Project): Promise<void> {
+  const armed = 'real run armed (PIPELINE_BOARD_ENABLE_RUNS=1)'
+
+  const finish = async (
+    patch: Partial<TicketRunStatus> & { status: 'succeeded' | 'failed' },
+    note: string,
+  ): Promise<void> => {
+    const terminal: TicketRunStatus = {
+      ...seed,
+      updatedAt: nowIso(),
+      finishedAt: nowIso(),
+      logTail: note,
+      ...patch,
+    }
+    try {
+      await writeTicketRunStatus(terminal)
+    } catch {
+      // best effort — the staleness guard coerces the orphaned `running` seed to failed.
+    }
+  }
+
+  // Pre-flight: the dir + feature-pipeline shape could have vanished between the boundary's
+  // ticketExists check and now — surface a legible `failed` rather than an opaque child error.
+  try {
+    const dirStat = await fs.stat(project.path)
+    if (!dirStat.isDirectory()) {
+      await finish({ status: 'failed', error: 'project path is not a directory' }, armed)
+      return
+    }
+  } catch {
+    await finish({ status: 'failed', error: 'project directory not found' }, armed)
+    return
+  }
+  try {
+    await fs.stat(join(project.path, 'claudedocs', 'tickets'))
+  } catch {
+    await finish(
+      { status: 'failed', error: 'no claudedocs/tickets/ (not a feature-pipeline workspace)' },
+      armed,
+    )
+    return
+  }
+
+  const r = await spawnFlow(project, seed.ticketId, seed.createPr)
+  const raw = tail(r.stdout + (r.stderr ? `\n[stderr]\n${r.stderr}` : ''))
+  const note = raw ? `${armed}\n${raw}` : armed
+
+  if (r.spawnError) {
+    const why =
+      (r.spawnError as NodeJS.ErrnoException).code === 'ENOENT'
+        ? "'claude' CLI not found on PATH"
+        : `spawn failed: ${r.spawnError.message}`
+    await finish({ status: 'failed', error: why }, note)
+    return
+  }
+  if (r.code === 0) {
+    const prUrl = parseFlowReport(r.stdout) ?? undefined
+    await finish(prUrl ? { status: 'succeeded', prUrl } : { status: 'succeeded' }, note)
+    return
+  }
+  if (r.code === null && r.signal) {
+    await finish(
+      {
+        status: 'failed',
+        error: `killed (${r.signal}) — likely timed out after ${Math.round(RUN_TIMEOUT_MS / 60_000)}m`,
+      },
+      note,
+    )
+    return
+  }
+  await finish({ status: 'failed', error: `flow exited with code ${r.code}` }, note)
 }

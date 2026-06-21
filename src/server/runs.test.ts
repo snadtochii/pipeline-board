@@ -3,11 +3,14 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  ALLOWED_TOOLS,
   RUN_STALE_MS,
+  buildFlowArgs,
   isTicketRunAction,
   isTicketRunRunning,
   isTicketRunStatus,
   makeRunId,
+  parseFlowReport,
   readLatestTicketRun,
   readTicketRunStatus,
   startGuardedTicketRun,
@@ -28,6 +31,8 @@ beforeEach(async () => {
 afterEach(async () => {
   await fs.rm(dir, { recursive: true, force: true })
   delete process.env.PIPELINE_BOARD_CONFIG_DIR
+  // PB-15 gate tests set this; clear it so it never leaks into a later test (which would arm a real spawn).
+  delete process.env.PIPELINE_BOARD_ENABLE_RUNS
 })
 
 const runsDir = (): string => join(dir, 'runs')
@@ -46,6 +51,21 @@ function freshRunningRun(overrides: Partial<TicketRunStatus> = {}): TicketRunSta
     updatedAt: now,
     finishedAt: null,
     ...overrides,
+  }
+}
+
+/**
+ * Wait for a live (env-armed) run's fire-and-forget continuation to write its terminal status, so its
+ * async file write lands BEFORE afterEach removes the tmp dir (otherwise rmdir races the write →
+ * ENOTEMPTY). The continuation never spawns `claude` in tests — `project.path` lacks
+ * `claudedocs/tickets/`, so runRealFlow short-circuits at preflight and writes `failed` fast.
+ */
+async function awaitTerminal(runId: string | undefined): Promise<void> {
+  if (!runId) return
+  for (let i = 0; i < 200; i++) {
+    const s = await readTicketRunStatus(runId)
+    if (s && s.status !== 'running') return
+    await new Promise((r) => setTimeout(r, 5))
   }
 }
 
@@ -273,5 +293,175 @@ describe('startGuardedTicketRun', () => {
       child.status?.runId,
     )
     expect((await readLatestTicketRun('Pipeline Board', 'PB-13'))?.runId).toBe(solo.status?.runId)
+  })
+})
+
+// ── PB-15: flow adapter (pure — no spawning) ──────────────────────────────────
+
+describe('buildFlowArgs', () => {
+  it('builds the /feature:flow <id> --pr vector with the runner allowlist and a capable default model', () => {
+    const args = buildFlowArgs('PB-1', { createPr: true })
+    expect(args.slice(0, 3)).toEqual(['-p', '/feature:flow PB-1 --pr', '--allowedTools'])
+    expect(args.slice(-2)).toEqual(['--model', 'opus'])
+    // the runner's OWN broader allowlist (vs sync's narrow one)
+    expect(args).toContain('Skill')
+    expect(args).toContain('Task')
+    expect(args).toContain('Write')
+    expect(args).toContain('Edit')
+    expect(args).toContain('Bash(git:*)')
+    expect(args).toContain('Bash(gh:*)')
+    expect(args).toContain('Bash(npm:*)')
+    // Bash(mv:*) is load-bearing: every state transition does a plain `mv` of the (git-ignored)
+    // ticket folder; git mv refuses ignored paths, so without this the first folder move stalls.
+    expect(args).toContain('Bash(mv:*)')
+  })
+
+  it('defaults createPr to true (the v1 UI always requests a PR)', () => {
+    expect(buildFlowArgs('PB-1')[1]).toBe('/feature:flow PB-1 --pr')
+  })
+
+  it('omits --pr when createPr is false', () => {
+    expect(buildFlowArgs('PB-1', { createPr: false })[1]).toBe('/feature:flow PB-1')
+  })
+
+  it('NEVER emits --dangerously-skip-permissions', () => {
+    expect(buildFlowArgs('PB-1')).not.toContain('--dangerously-skip-permissions')
+  })
+
+  it('uses Bash only in scoped form — no unscoped Bash (least privilege on the riskiest surface)', () => {
+    const args = buildFlowArgs('PB-1')
+    expect(args).not.toContain('Bash')
+    // every Bash entry must be scoped Bash(...)
+    for (const t of args) {
+      if (t.startsWith('Bash')) expect(t).toMatch(/^Bash\([^)]+\)$/)
+    }
+  })
+
+  it('honors an explicit model override and falls back to the default on blank', () => {
+    expect(buildFlowArgs('PB-1', { model: 'haiku' }).slice(-2)).toEqual(['--model', 'haiku'])
+    expect(buildFlowArgs('PB-1', { model: '   ' }).slice(-2)).toEqual(['--model', 'opus'])
+    expect(buildFlowArgs('PB-1', { model: '' }).slice(-2)).toEqual(['--model', 'opus'])
+  })
+
+  it('rejects an unsafe ticketId BEFORE building any args (no interpolation)', () => {
+    expect(() => buildFlowArgs('../etc/passwd')).toThrow()
+    expect(() => buildFlowArgs('PB-1; rm -rf /')).toThrow()
+    expect(() => buildFlowArgs('a/b')).toThrow()
+  })
+
+  it('rejects an id that fails the strict /^[A-Z][A-Z0-9]+-\\d+$/ shape', () => {
+    expect(() => buildFlowArgs('pb-1')).toThrow() // lowercase
+    expect(() => buildFlowArgs('PB1')).toThrow() // no dash
+    expect(() => buildFlowArgs('PB-')).toThrow() // no number
+    expect(() => buildFlowArgs('1PB-2')).toThrow() // leading digit
+  })
+
+  it('exposes a scoped, dangerous-flag-free allowlist constant', () => {
+    expect(ALLOWED_TOOLS).not.toContain('Bash')
+    expect(ALLOWED_TOOLS as readonly string[]).not.toContain('--dangerously-skip-permissions')
+    expect(ALLOWED_TOOLS).toContain('Skill')
+  })
+})
+
+describe('parseFlowReport', () => {
+  it('extracts a GitHub PR URL from a report tail', () => {
+    expect(parseFlowReport('… ✅ PR opened: https://github.com/acme/repo/pull/42 (branch …)')).toBe(
+      'https://github.com/acme/repo/pull/42',
+    )
+  })
+
+  it('returns null when no PR URL is present (a legitimate no-URL success)', () => {
+    expect(parseFlowReport('committed to feature/x — finalized to done/.')).toBeNull()
+    expect(parseFlowReport('')).toBeNull()
+  })
+
+  it('returns the first URL when several are present', () => {
+    const text =
+      'https://github.com/a/b/pull/1 then https://github.com/a/b/pull/2'
+    expect(parseFlowReport(text)).toBe('https://github.com/a/b/pull/1')
+  })
+})
+
+// ── PB-15: env gate + per-project lock (no spawning — gate stays at dry/preflight-fail) ─
+
+describe('env gate (PIPELINE_BOARD_ENABLE_RUNS)', () => {
+  it('with the flag unset, takes the dry-run branch (dryRun, succeeded, no spawn)', async () => {
+    // flag unset by default (afterEach clears it)
+    const res = await startGuardedTicketRun(project, 'PB-1')
+    expect(res.started).toBe(true)
+    expect(res.status?.dryRun).toBe(true)
+    expect(res.status?.status).toBe('succeeded')
+    expect(res.status?.finishedAt).not.toBeNull()
+    expect(res.status?.logTail).toMatch(/dry run/i)
+  })
+
+  it('with the flag set to a non-"1" value, still dry-runs (strict exact match, fail-safe)', async () => {
+    process.env.PIPELINE_BOARD_ENABLE_RUNS = '0'
+    expect((await startGuardedTicketRun(project, 'PB-1')).status?.dryRun).toBe(true)
+    process.env.PIPELINE_BOARD_ENABLE_RUNS = 'true'
+    expect((await startGuardedTicketRun(project, 'PB-2')).status?.dryRun).toBe(true)
+    process.env.PIPELINE_BOARD_ENABLE_RUNS = ' 1 '
+    expect((await startGuardedTicketRun(project, 'PB-3')).status?.dryRun).toBe(true)
+  })
+})
+
+describe('per-project real-flow lock', () => {
+  // `project.path` ('/tmp/does-not-matter') has no claudedocs/tickets/, so any live continuation
+  // short-circuits at runRealFlow's preflight → it writes a `failed` terminal status WITHOUT ever
+  // spawning `claude`. We assert only the synchronous guard return, which is deterministic.
+
+  it('refuses a second REAL flow in the same project (project-busy)', async () => {
+    process.env.PIPELINE_BOARD_ENABLE_RUNS = '1'
+    // Seed an active REAL run for one ticket in the project.
+    await writeTicketRunStatus(
+      freshRunningRun({ runId: 'run-real', ticketId: 'PB-1', dryRun: false }),
+    )
+    const res = await startGuardedTicketRun(project, 'PB-2')
+    expect(res.started).toBe(false)
+    expect(res.reason).toBe('project-busy')
+    // The active run was not overwritten.
+    expect((await readLatestTicketRun('Pipeline Board', 'PB-1'))?.runId).toBe('run-real')
+  })
+
+  it('does NOT count a DRY running run toward the project lock', async () => {
+    process.env.PIPELINE_BOARD_ENABLE_RUNS = '1'
+    // A dry running run (dryRun: true) must not block a real start.
+    await writeTicketRunStatus(
+      freshRunningRun({ runId: 'run-dry', ticketId: 'PB-1', dryRun: true }),
+    )
+    const res = await startGuardedTicketRun(project, 'PB-2')
+    expect(res.started).toBe(true)
+    expect(res.reason).toBeUndefined()
+    expect(res.status?.dryRun).toBe(false) // armed: a real seed
+    expect(res.status?.status).toBe('running') // live seed returns running (fire-and-forget)
+    await awaitTerminal(res.status?.runId) // let the no-spawn continuation finish before teardown
+  })
+
+  it('does NOT count a STALE real run toward the project lock (coerced to failed)', async () => {
+    process.env.PIPELINE_BOARD_ENABLE_RUNS = '1'
+    const old = new Date(Date.now() - (RUN_STALE_MS + 60_000)).toISOString()
+    await writeTicketRunStatus(
+      freshRunningRun({
+        runId: 'run-stale-real',
+        ticketId: 'PB-1',
+        dryRun: false,
+        startedAt: old,
+        updatedAt: old,
+      }),
+    )
+    const res = await startGuardedTicketRun(project, 'PB-2')
+    expect(res.started).toBe(true)
+    expect(res.reason).toBeUndefined()
+    await awaitTerminal(res.status?.runId) // let the no-spawn continuation finish before teardown
+  })
+
+  it('does not apply the project lock to a DRY (gate-off) start', async () => {
+    // Gate off → no per-project lock at all; a real run elsewhere is irrelevant to a dry start.
+    await writeTicketRunStatus(
+      freshRunningRun({ runId: 'run-real-2', ticketId: 'PB-1', dryRun: false }),
+    )
+    const res = await startGuardedTicketRun(project, 'PB-2')
+    expect(res.started).toBe(true)
+    expect(res.status?.dryRun).toBe(true)
   })
 })

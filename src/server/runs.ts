@@ -346,9 +346,18 @@ async function findActiveRealRunForProject(projectName: string): Promise<TicketR
 // never from the client bundle.
 
 /**
- * Build the `claude -p` argument vector for a real `/feature:flow <id> [--pr]` run. Pure +
- * exported so the vector shape (allowlist, model, --pr, no `--dangerously-skip-permissions`) is
- * unit-tested WITHOUT spawning. Mirrors sync.ts buildSyncArgs.
+ * Build the `claude -p` argument vector for a real `/feature:flow <id> [--pr] --no-ui-testing` run.
+ * Pure + exported so the vector shape (allowlist, model, --pr, --no-ui-testing, no
+ * `--dangerously-skip-permissions`) is unit-tested WITHOUT spawning. Mirrors sync.ts buildSyncArgs.
+ *
+ * `--no-ui-testing` (feature-pipeline FP-19) is passed UNCONDITIONALLY — not gated by `createPr` —
+ * because a headless `claude -p` can never get the interactive browser-MCP permission the build's
+ * ui-tester checkpoint needs, regardless of whether a PR is requested (PB-16 stalled ~10m at exactly
+ * that gate). Flow forwards the flag to build, which skips only the browser/ui-tester portion of the
+ * test checkpoint; typecheck/test still run and still gate the verdict. Browser-level
+ * acceptance-criteria verification is deferred to a human at PR review. For a non-UI ticket the flag
+ * is a no-op — build skips ui-tester anyway. It is a slash-command argument, NOT a tool grant, so it
+ * goes in the command string and `ALLOWED_TOOLS` stays untouched (no browser MCP tools).
  *
  * `ticketId` is rejected (throws — no args produced) if it fails the safe-segment + strict
  * `TICKET_ID_RE` guard, BEFORE it can be interpolated into the slash command. This is
@@ -364,7 +373,7 @@ export function buildFlowArgs(
     throw new Error(`Unsafe or invalid ticketId for flow command: ${ticketId}`)
   }
   const createPr = options?.createPr ?? true
-  const command = `/feature:flow ${ticketId}${createPr ? ' --pr' : ''}`
+  const command = `/feature:flow ${ticketId}${createPr ? ' --pr' : ''} --no-ui-testing`
   const m = options?.model && options.model.trim() ? options.model.trim() : DEFAULT_FLOW_MODEL
   return ['-p', command, '--allowedTools', ...ALLOWED_TOOLS, '--model', m]
 }
@@ -568,7 +577,13 @@ export async function startGuardedTicketRun(
  * prUrl); code null + signal → failed (timeout/kill); else failed with the exit code.
  */
 async function runRealFlow(seed: TicketRunStatus, project: Project): Promise<void> {
-  const armed = 'real run armed (PIPELINE_BOARD_ENABLE_RUNS=1)'
+  // The note rides logTail on EVERY terminal status (succeeded/needs-human/failed all route through
+  // finish(... , note); preflight-fail paths use `armed` directly). The second line is the honesty
+  // marker (PB-18): the headless runner always spawns flow with --no-ui-testing, so a UI ticket's
+  // `succeeded` must not be read as "browser-verified" — browser checks are deferred to human PR review.
+  const armed =
+    'real run armed (PIPELINE_BOARD_ENABLE_RUNS=1)\n' +
+    'browser/UI verification skipped (spawned with --no-ui-testing) — deferred to human PR review'
 
   const finish = async (
     patch: Partial<TicketRunStatus> & { status: 'succeeded' | 'failed' | 'needs-human' },

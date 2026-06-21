@@ -311,6 +311,9 @@ describe('buildFlowArgs', () => {
     expect(args).toContain('Bash(git:*)')
     expect(args).toContain('Bash(gh:*)')
     expect(args).toContain('Bash(npm:*)')
+    // Bash(mv:*) is load-bearing: every state transition does a plain `mv` of the (git-ignored)
+    // ticket folder; git mv refuses ignored paths, so without this the first folder move stalls.
+    expect(args).toContain('Bash(mv:*)')
   })
 
   it('defaults createPr to true (the v1 UI always requests a PR)', () => {

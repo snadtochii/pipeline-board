@@ -32,16 +32,22 @@ export const RUN_TIMEOUT_MS = 40 * 60_000
 
 /**
  * The runner's OWN least-privilege allowlist for the spawned `/feature:flow --pr`. Broader than
- * sync's (sync is mechanical) because flow runs plan + build: writes ticket artifacts, runs the
- * project's validation (typecheck/test/build via npm), spawns reviewer/ui-tester subagents (Task),
- * invokes plan/build (Skill), and opens a PR (git/gh). Resolved against the current flow + build
- * SKILL.md `allowed-tools` and build/references/pr-creation.md (2026-06-21):
+ * sync's (sync is mechanical) because flow runs plan + build: writes ticket artifacts, MOVES the
+ * ticket folder between state dirs at each transition, runs the project's validation
+ * (typecheck/test/build via npm), spawns reviewer/ui-tester subagents (Task), invokes plan/build
+ * (Skill), and opens a PR (git/gh). Resolved against the current flow + build SKILL.md
+ * `allowed-tools`, build/references/pr-creation.md, and flow/references/state-transitions.md (2026-06-21):
  *   - flow needs:  Read, Glob, Grep, TodoWrite, Skill
  *   - build needs: Read, Write, Edit, Glob, Grep, Bash, Task, TodoWrite
+ *   - state transitions: Bash(mv:*) — every transition does a plain `mv` of the ticket folder
+ *     between backlog/in-progress/review/done. Because `claudedocs/` is git-ignored in this repo
+ *     (and typically in the consumer), `git mv` refuses the ignored path, so the move is plain `mv`.
+ *     Sync grants `Bash(mv:*)` for the same reason. WITHOUT this, the first folder move under
+ *     headless `claude -p` (no TTY, no `--dangerously-skip-permissions`) is denied and the run stalls.
  *   - pr-creation: Bash(git:*) (fetch/checkout/stash/commit/push), Bash(gh:*) (auth/pr create/view/list),
  *                  Bash(command:*) (`command -v gh`)
  *   - this repo's validation: npm run typecheck / npm test / npm run build → Bash(npm:*)
- * Bash is SCOPED (git/gh/npm/command), never unscoped — least privilege on the riskiest surface.
+ * Bash is SCOPED (git/gh/npm/mv/command), never unscoped — least privilege on the riskiest surface.
  * `AskUserQuestion` is deliberately OMITTED: headless `-p` has no TTY, so a nested interactive branch
  * (e.g. pr-creation's detached-HEAD prompt) fails fast → `failed`, rather than hanging to the timeout.
  * NEVER emit `--dangerously-skip-permissions`.
@@ -58,6 +64,7 @@ export const ALLOWED_TOOLS = [
   'Bash(git:*)',
   'Bash(gh:*)',
   'Bash(npm:*)',
+  'Bash(mv:*)',
   'Bash(command:*)',
 ] as const
 

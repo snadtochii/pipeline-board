@@ -2,23 +2,13 @@ import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { getSyncStatus, startSync } from '../server/functions'
 import { POLL_INTERVAL_MS, queryKeys } from '../lib/query'
+import { relativeTime } from '../lib/relative-time'
 import type { SyncRunStatus } from '../server/types'
 
 // Header control (PB-6): triggers a board-wide /feature:sync sweep and shows live
 // status. The button is the actuator; the chip is the (polled) progress/result.
 // The chip is fixed-width so text swaps never reflow the topbar (PB-4 convention).
-
-function relativeTime(iso: string, now: number): string {
-  const then = Date.parse(iso)
-  if (Number.isNaN(then)) return ''
-  const secs = Math.max(0, Math.round((now - then) / 1000))
-  if (secs < 45) return 'just now'
-  const mins = Math.round(secs / 60)
-  if (mins < 60) return `${mins}m ago`
-  const hrs = Math.round(mins / 60)
-  if (hrs < 24) return `${hrs}h ago`
-  return `${Math.round(hrs / 24)}d ago`
-}
+// relativeTime is shared with the per-ticket run chip (PB-14) via src/lib.
 
 /** Count of workspaces that have reached a terminal state (for the "n/N" progress). */
 function progressCount(status: SyncRunStatus): number {

@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   deriveColumn,
+  deriveCompletedAt,
   deriveStage,
   detectStaleFolder,
   expectedFolderForStatus,
@@ -304,5 +305,71 @@ describe('getArtifactFromRoot', () => {
     const res = await getArtifactFromRoot({ name: 'fix', path: root }, 'PB-10', '../../../etc/passwd')
     expect(res.found).toBe(false)
     expect(res.error).toMatch(/Invalid/)
+  })
+})
+
+// ---- completion-date derivation (Done-column sort, PB-10) ----------------
+// Own temp root so fs.utimes mtime manipulation can't perturb the shared scan.
+
+describe('completedAt derivation', () => {
+  let cRoot: string
+  let cResult: ProjectScanResult
+
+  // Fixed, ms-precise instants so toISOString() round-trips exactly.
+  const T_OLD = new Date('2026-06-07T10:00:00.000Z')
+  const T_MID = new Date('2026-06-08T10:00:00.000Z')
+  const T_NEW = new Date('2026-06-11T10:00:00.000Z')
+
+  const fileAt = (state: string, id: string, name: string) =>
+    join(cRoot, 'claudedocs', 'tickets', state, id, name)
+
+  async function writeAt(state: string, id: string, files: Record<string, string>) {
+    const dir = join(cRoot, 'claudedocs', 'tickets', state, id)
+    await fs.mkdir(dir, { recursive: true })
+    for (const [name, content] of Object.entries(files)) {
+      await fs.writeFile(join(dir, name), content, 'utf8')
+    }
+  }
+
+  beforeAll(async () => {
+    cRoot = await fs.mkdtemp(join(tmpdir(), 'pb-completed-'))
+
+    // Done ticket WITH a summary → completedAt is the summary's mtime, even though
+    // 01-spec.md is newer-on-disk would be wrong — we set spec OLDER to prove the
+    // summary wins (not a max-over-all-artifacts).
+    await writeAt('done', 'PB-1', { '01-spec.md': spec({ status: 'done' }), '06-summary.md': '# s' })
+    await fs.utimes(fileAt('done', 'PB-1', '06-summary.md'), T_NEW, T_NEW)
+    await fs.utimes(fileAt('done', 'PB-1', '01-spec.md'), T_OLD, T_OLD)
+
+    // Done (partial-completion) ticket with NO summary → fallback to the newest
+    // mtime among present artifacts: 01-spec (T_MID) beats 02-plan (T_OLD).
+    await writeAt('done', 'PB-2', { '01-spec.md': spec({ status: 'partial-completion' }), '02-plan.md': '# p' })
+    await fs.utimes(fileAt('done', 'PB-2', '01-spec.md'), T_MID, T_MID)
+    await fs.utimes(fileAt('done', 'PB-2', '02-plan.md'), T_OLD, T_OLD)
+
+    // Non-Done ticket → completedAt null (Done-only guard, no stat performed).
+    await writeAt('backlog', 'PB-3', { '01-spec.md': spec({ status: 'backlog' }) })
+
+    cResult = await scanProjectRoot({ name: 'fix', path: cRoot })
+  })
+
+  afterAll(async () => {
+    await fs.rm(cRoot, { recursive: true, force: true })
+  })
+
+  it('uses 06-summary.md mtime for a Done ticket that has a summary', () => {
+    expect(byId(cResult, 'PB-1')?.completedAt).toBe(T_NEW.toISOString())
+  })
+
+  it('falls back to the newest present-artifact mtime when there is no summary', () => {
+    expect(byId(cResult, 'PB-2')?.completedAt).toBe(T_MID.toISOString())
+  })
+
+  it('leaves completedAt null for a non-Done ticket', () => {
+    expect(byId(cResult, 'PB-3')?.completedAt).toBeNull()
+  })
+
+  it('deriveCompletedAt returns null for an empty artifact set', async () => {
+    expect(await deriveCompletedAt(cRoot, [])).toBeNull()
   })
 })

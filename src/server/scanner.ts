@@ -186,6 +186,36 @@ export async function classifyDir(dirPath: string, names: readonly string[]): Pr
   return 'unknown'
 }
 
+/**
+ * The completion timestamp for a Done-column ticket, as ISO 8601, or null when none
+ * can be derived. Primary signal is `06-summary.md`'s mtime — the terminal pipeline
+ * artifact, so its mtime ≈ when the ticket was finished. When there's no summary
+ * (cancelled/partial-completion, or a degraded folder) it falls back to the newest
+ * mtime among the present artifacts (`01-spec.md` is always among them for a
+ * renderable ticket, so only truly empty/unreadable folders end up null). Each
+ * `fs.stat` is guarded: a file vanishing between readdir and stat is skipped, never
+ * thrown — a null result simply sorts the card last. `dir` is the ticket's own
+ * folder, so an epic child reads its own `tasks/<child>/06-summary.md` for free.
+ */
+export async function deriveCompletedAt(
+  dir: string,
+  artifactNames: readonly string[],
+): Promise<string | null> {
+  const candidates = artifactNames.includes('06-summary.md')
+    ? ['06-summary.md'] // terminal artifact → its mtime IS the completion time
+    : artifactNames // no summary → newest present-artifact mtime
+  let newest: number | null = null
+  for (const name of candidates) {
+    try {
+      const { mtimeMs } = await fs.stat(join(dir, name))
+      if (newest === null || mtimeMs > newest) newest = mtimeMs
+    } catch {
+      // file vanished between readdir and stat — skip; undated falls to the id tiebreak
+    }
+  }
+  return newest === null ? null : new Date(newest).toISOString()
+}
+
 async function buildTicket(
   dir: string,
   dirName: string,
@@ -204,18 +234,24 @@ async function buildTicket(
     meta = { title: null, priority: null, complexity: null, status: null, tags: [], metadataError: true }
   }
 
+  // Only Done-column cards consume completedAt; computing it elsewhere would stat
+  // every backlog/in-progress ticket on each poll for a value nothing reads.
+  const column = deriveColumn(meta.status, folder, isChild) // status-derived; folder is informational
+  const completedAt = column === 'done' ? await deriveCompletedAt(dir, artifacts) : null
+
   return {
     id: dirName, // folder name IS the ticket id (data contract)
     title: meta.title ?? dirName,
     priority: meta.priority,
     complexity: meta.complexity,
     status: meta.status,
-    column: deriveColumn(meta.status, folder, isChild), // status-derived; folder is informational
+    column,
     derivedStage: deriveStage(names),
     projectName,
     tags: meta.tags,
     ...(parentEpicId !== undefined ? { parentEpicId } : {}),
     artifacts,
+    completedAt,
     staleFolder: detectStaleFolder(meta.status, folder, isChild),
     metadataError: meta.metadataError,
   }

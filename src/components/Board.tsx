@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { listProjects, scanAll } from '../server/functions'
-import { POLL_INTERVAL_MS, PRIORITY_RANK, queryKeys } from '../lib/query'
+import { POLL_INTERVAL_MS, queryKeys } from '../lib/query'
+import { comparatorFor } from '../lib/sort'
 import { loadCollapsedColumns, saveCollapsedColumns } from '../lib/collapsed-columns'
 import { STATE_FOLDERS } from '../server/types'
 import type { Column as Col, ProjectScanResult, TicketDTO } from '../server/types'
@@ -12,13 +13,6 @@ import { AddProjectDialog } from './AddProjectDialog'
 import { DetailPanel } from './DetailPanel'
 import { ProjectErrorChip } from './ProjectErrorChip'
 import { EmptyState } from './EmptyState'
-
-function sortTickets(a: TicketDTO, b: TicketDTO): number {
-  const ra = a.priority ? PRIORITY_RANK[a.priority] : 0
-  const rb = b.priority ? PRIORITY_RANK[b.priority] : 0
-  if (ra !== rb) return rb - ra // higher priority first
-  return a.id.localeCompare(b.id)
-}
 
 export function Board() {
   const scan = useQuery({
@@ -109,7 +103,7 @@ export function Board() {
     for (const r of visible) {
       for (const t of r.tickets) map[t.column].push(t)
     }
-    for (const col of STATE_FOLDERS) map[col].sort(sortTickets)
+    for (const col of STATE_FOLDERS) map[col].sort(comparatorFor(col))
     return map
   }, [visible])
 

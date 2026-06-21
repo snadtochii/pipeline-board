@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { TICKET_ID_RE } from './functions'
 import { ticketExists, validateProjectPath } from './scanner'
 import type { Project } from './types'
 
@@ -88,5 +89,34 @@ describe('ticketExists', () => {
     await fs.mkdir(join(root, 'claudedocs', 'tickets', 'backlog'), { recursive: true })
     await fs.writeFile(join(root, 'claudedocs', 'tickets', 'backlog', 'PB-1'), 'x', 'utf8')
     expect(await ticketExists(proj(), 'PB-1')).toBe(false)
+  })
+})
+
+describe('TICKET_ID_RE (boundary gate)', () => {
+  // This regex is the real validation barrier for startTicketRun/getTicketRunStatus
+  // and the defense-in-depth gate for PB-15's command interpolation. Lock its
+  // accept/reject behavior directly so it can't silently drift.
+  it('accepts well-formed ids', () => {
+    for (const id of ['PB-13', 'PB-1', 'ABC-123', 'A1-9', 'XY9Z-42']) {
+      expect(TICKET_ID_RE.test(id)).toBe(true)
+    }
+  })
+
+  it('rejects malformed / unsafe ids (lowercase, no hyphen, traversal, separators, empty)', () => {
+    for (const id of [
+      'pb-13', // lowercase prefix
+      'PB13', // no hyphen
+      'PB-', // no number
+      '-13', // no prefix
+      '1PB-3', // must start with a letter
+      'PB-13/x', // embedded slash (path separator)
+      'PB-13\\x', // embedded backslash
+      '../PB-13', // traversal
+      'PB-13 ', // trailing space
+      'PB-1.3', // dot
+      '', // empty
+    ]) {
+      expect(TICKET_ID_RE.test(id)).toBe(false)
+    }
   })
 })

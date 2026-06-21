@@ -23,8 +23,10 @@ import type {
 // work lives in ./scanner, ./config, ./sync and ./runs, reached only inside handler bodies.
 
 /** Strict ticket/epic id shape (e.g. `PB-13`). Defense-in-depth for the run key and
- *  PB-15's future command interpolation — a plain regex, no Node-builtin import. */
-const TICKET_ID_RE = /^[A-Z][A-Z0-9]+-\d+$/
+ *  PB-15's future command interpolation — a plain regex, no Node-builtin import.
+ *  Exported so a unit test can lock the boundary gate against drift (it's the real
+ *  validation barrier in startTicketRun/getTicketRunStatus). */
+export const TICKET_ID_RE = /^[A-Z][A-Z0-9]+-\d+$/
 
 export interface AddProjectResult {
   ok: boolean

@@ -482,6 +482,14 @@ describe('per-project real-flow lock', () => {
     expect(res.status?.dryRun).toBe(false) // armed: a real seed
     expect(res.status?.status).toBe('running') // live seed returns running (fire-and-forget)
     await awaitTerminal(res.status?.runId) // let the no-spawn continuation finish before teardown
+
+    // PB-18 AC3: the terminal status of a LIVE run carries the skipped-UI-testing honesty marker in
+    // logTail (here via the preflight-fail path, which uses `armed` directly — project.path has no
+    // claudedocs/tickets/). Pins the marker so a future edit to `armed` can't silently drop it.
+    const terminal = await readTicketRunStatus(res.status?.runId ?? '')
+    expect(terminal?.status).not.toBe('running')
+    expect(terminal?.logTail).toMatch(/--no-ui-testing/)
+    expect(terminal?.logTail).toMatch(/deferred to human PR review/i)
   })
 
   it('does NOT count a STALE real run toward the project lock (coerced to failed)', async () => {

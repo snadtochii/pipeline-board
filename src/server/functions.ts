@@ -8,6 +8,7 @@ import { readLatestTicketRun, startGuardedTicketRun } from './runs'
 import type { StartTicketRunResult } from './runs'
 import { filesystemTicketSource, ticketExists, validateProjectPath } from './scanner'
 import { readSyncStatus, startGuardedRun } from './sync'
+import { TICKET_ID_RE } from './types'
 import type {
   ArtifactResult,
   Project,
@@ -22,11 +23,12 @@ import type {
 // body stays in the client bundle and would crash on hydration. All filesystem
 // work lives in ./scanner, ./config, ./sync and ./runs, reached only inside handler bodies.
 
-/** Strict ticket/epic id shape (e.g. `PB-13`). Defense-in-depth for the run key and
- *  PB-15's future command interpolation — a plain regex, no Node-builtin import.
- *  Exported so a unit test can lock the boundary gate against drift (it's the real
- *  validation barrier in startTicketRun/getTicketRunStatus). */
-export const TICKET_ID_RE = /^[A-Z][A-Z0-9]+-\d+$/
+/** Strict ticket/epic id shape (e.g. `PB-13`). The canonical regex lives in ./types (a
+ *  Node-builtin-free module both server and client safely import — declared once, no clone to
+ *  drift); re-exported here so existing importers (the DetailPanel control gate, functions.test)
+ *  keep their `from './functions'` path. It is the real validation barrier in
+ *  startTicketRun/getTicketRunStatus (and runs.ts's buildFlowArgs uses the same source). */
+export { TICKET_ID_RE }
 
 export interface AddProjectResult {
   ok: boolean

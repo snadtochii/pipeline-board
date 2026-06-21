@@ -7,12 +7,16 @@ import {
   isTicketRunAction,
   isTicketRunRunning,
   isTicketRunStatus,
+  makeRunId,
   readLatestTicketRun,
   readTicketRunStatus,
+  startGuardedTicketRun,
   ticketRunKey,
   writeTicketRunStatus,
 } from './runs'
-import type { TicketRunStatus } from './types'
+import type { Project, TicketRunStatus } from './types'
+
+const project: Project = { name: 'Pipeline Board', path: '/tmp/does-not-matter' }
 
 let dir: string
 
@@ -197,5 +201,77 @@ describe('run-status persistence', () => {
     expect((await readLatestTicketRun('Pipeline Board', 'PB-1'))?.runId).toBe('run-c1')
     expect((await readLatestTicketRun('Pipeline Board', 'PB-2'))?.runId).toBe('run-c2')
     expect((await readLatestTicketRun('Pipeline Board', 'PB-3'))?.runId).toBe('run-c3')
+  })
+})
+
+describe('makeRunId', () => {
+  it('produces distinct ids for same-millisecond calls (uuid suffix, not bare timestamp)', () => {
+    const ids = new Set(Array.from({ length: 100 }, () => makeRunId()))
+    expect(ids.size).toBe(100)
+  })
+
+  it('is path-safe and well-shaped (run-<stamp>-<8hex>, no : or .)', () => {
+    const id = makeRunId()
+    expect(id).toMatch(/^run-[0-9TZ-]+-[0-9a-f]{8}$/)
+    expect(id).not.toContain(':')
+    expect(id).not.toContain('.')
+  })
+})
+
+describe('startGuardedTicketRun', () => {
+  it('records a dry run: succeeded, dryRun, log note, and updates latest.json', async () => {
+    const res = await startGuardedTicketRun(project, 'PB-12')
+    expect(res.started).toBe(true)
+    expect(res.reason).toBeUndefined()
+    expect(res.status?.status).toBe('succeeded')
+    expect(res.status?.dryRun).toBe(true)
+    expect(res.status?.createPr).toBe(true)
+    expect(res.status?.finishedAt).not.toBeNull()
+    expect(res.status?.logTail).toMatch(/dry run/i)
+
+    // latest.json points at the terminal status (proves persistence + index update)
+    const latest = await readLatestTicketRun('Pipeline Board', 'PB-12')
+    expect(latest?.status).toBe('succeeded')
+    expect(latest?.runId).toBe(res.status?.runId)
+  })
+
+  it('refuses a second run while one is genuinely running (per-ticket lock)', async () => {
+    // Seed an active run for this ticket (the lock the guard must observe).
+    await writeTicketRunStatus(freshRunningRun({ runId: 'run-active', ticketId: 'PB-12' }))
+    const res = await startGuardedTicketRun(project, 'PB-12')
+    expect(res.started).toBe(false)
+    expect(res.reason).toBe('already-running')
+    // latest is unchanged — the active run was not overwritten.
+    expect((await readLatestTicketRun('Pipeline Board', 'PB-12'))?.runId).toBe('run-active')
+  })
+
+  it('is NOT blocked by a stale running run (coerced to failed on read)', async () => {
+    const old = new Date(Date.now() - (RUN_STALE_MS + 60_000)).toISOString()
+    await writeTicketRunStatus(
+      freshRunningRun({ runId: 'run-stale', ticketId: 'PB-12', startedAt: old, updatedAt: old }),
+    )
+    const res = await startGuardedTicketRun(project, 'PB-12')
+    expect(res.started).toBe(true)
+    expect(res.status?.status).toBe('succeeded')
+    expect(res.status?.runId).not.toBe('run-stale')
+  })
+
+  it('defaults createPr to true and honors createPr: false', async () => {
+    const def = await startGuardedTicketRun(project, 'PB-1')
+    expect(def.status?.createPr).toBe(true)
+    const off = await startGuardedTicketRun(project, 'PB-2', undefined, { createPr: false })
+    expect(off.status?.createPr).toBe(false)
+  })
+
+  it('keys an epic child separately from a same-leaf solo', async () => {
+    const child = await startGuardedTicketRun(project, 'PB-13', 'PB-11')
+    const solo = await startGuardedTicketRun(project, 'PB-13')
+    expect(child.status?.parentEpicId).toBe('PB-11')
+    expect(solo.status?.parentEpicId).toBeUndefined()
+    // Each resolves to its own latest entry — no collision.
+    expect((await readLatestTicketRun('Pipeline Board', 'PB-13', 'PB-11'))?.runId).toBe(
+      child.status?.runId,
+    )
+    expect((await readLatestTicketRun('Pipeline Board', 'PB-13'))?.runId).toBe(solo.status?.runId)
   })
 })

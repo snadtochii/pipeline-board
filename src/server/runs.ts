@@ -257,7 +257,11 @@ export interface StartTicketRunOptions {
 
 export interface StartTicketRunResult {
   started: boolean
-  /** Why a start was refused (`already-running`); absent on success. */
+  /**
+   * Why a start was refused; absent on success. This helper emits only
+   * `already-running`; the startTicketRun server fn adds `unknown-project` and
+   * `ticket-not-found` from its boundary checks (shared single contract).
+   */
   reason?: string
   /** The persisted status on a successful start (PB-14 renders it without a second poll). */
   status?: TicketRunStatus

@@ -5,6 +5,7 @@ import {
   removeProject as removeProjectConfig,
 } from './config'
 import { readLatestTicketRun, startGuardedTicketRun } from './runs'
+import type { StartTicketRunResult } from './runs'
 import { filesystemTicketSource, ticketExists, validateProjectPath } from './scanner'
 import { readSyncStatus, startGuardedRun } from './sync'
 import type {
@@ -143,13 +144,9 @@ export const startSync = createServerFn({ method: 'POST' }).handler(
 // ./scanner, reached only inside these handler bodies. In PB-13 a run is a DRY RUN
 // (no claude spawned); PB-15 arms the real spawn behind an env gate.
 
-export interface StartTicketRunResult {
-  started: boolean
-  /** Why a start was refused: `unknown-project`, `ticket-not-found`, or `already-running`. */
-  reason?: string
-  /** The persisted status on a successful start (PB-14 renders it without a second poll). */
-  status?: TicketRunStatus
-}
+// The start-result contract is owned by runs.ts (the orchestration layer); re-export
+// it here so client components importing from functions.ts get the same single type.
+export type { StartTicketRunResult } from './runs'
 
 /**
  * Start a (dry) run for one ticket. The validator enforces input shape AND the

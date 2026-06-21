@@ -11,6 +11,10 @@ export const queryKeys = {
   // child of another epic) never share a cache entry.
   artifact: (project: string, ticket: string, file: string, parentEpicId?: string) =>
     ['artifact', project, parentEpicId ?? '', ticket, file] as const,
+  // Per-ticket flow-run status (PB-14). Same parentEpicId ?? '' slot as artifact:
+  // a solo and an epic-child sharing a leaf id must not collide.
+  ticketRun: (project: string, ticket: string, parentEpicId?: string) =>
+    ['ticket-run', project, parentEpicId ?? '', ticket] as const,
 }
 
 /** Higher rank sorts first within a column. */

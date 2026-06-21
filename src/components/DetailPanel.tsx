@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
-import { getArtifact } from '../server/functions'
-import { queryKeys } from '../lib/query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { getArtifact, getTicketRunStatus, startTicketRun, TICKET_ID_RE } from '../server/functions'
+import { POLL_INTERVAL_MS, queryKeys } from '../lib/query'
+import { isTicketRunRunning, ticketRunChip } from '../lib/ticket-run'
 import type { TicketDTO } from '../server/types'
 import { MarkdownView } from './MarkdownView'
 
@@ -150,6 +151,8 @@ export function DetailPanel({
             {content.staleFolder && <span className="warn">⚠ stale folder</span>}
           </div>
 
+          <RunFlowControl ticket={content} />
+
           {content.tags.length > 0 && (
             <div className="detail-tags">
               {content.tags.map((t) => (
@@ -188,5 +191,130 @@ export function DetailPanel({
         </>
       )}
     </aside>
+  )
+}
+
+/**
+ * Per-ticket "Run Flow --pr" control + status chip (PB-14). Mirrors SyncControl's
+ * mutation + polled-status + optimistic-invalidate pattern, scoped to one ticket.
+ *
+ * Always rendered with a non-null `ticket` (the panel's `content`), so its hooks
+ * run unconditionally — no conditional-hook hazard. The query/mutation key off the
+ * passed ticket; on a panel swap React keeps this same component instance but the
+ * query key changes (project + parentEpicId + leaf id), so the chip auto-reflects
+ * the newly-keyed ticket's run (or "no runs yet") with no manual reset.
+ *
+ * Imports only RPC stubs from functions.ts and pure helpers from src/lib — no
+ * runs.ts/scanner.ts import, so no node:* leaks into the client bundle.
+ */
+function RunFlowControl({ ticket }: { ticket: TicketDTO }) {
+  const qc = useQueryClient()
+
+  // Hydration-safe clock (PB-5): null on first paint/SSR so no wall-clock string
+  // is emitted before mount; set on mount, then advance every 30s so the relative
+  // "succeeded 3m ago" ticks without a server round-trip.
+  const [now, setNow] = useState<number | null>(null)
+  useEffect(() => {
+    setNow(Date.now())
+    const id = setInterval(() => setNow(Date.now()), 30_000)
+    return () => clearInterval(id)
+  }, [])
+
+  // A degraded card (unparseable frontmatter → folder-name id) can carry an id the
+  // server validator's TICKET_ID_RE would reject, throwing on the RPC. Gate the
+  // control off for those: no query, button disabled.
+  const runnable = !ticket.metadataError && TICKET_ID_RE.test(ticket.id)
+  const key = queryKeys.ticketRun(ticket.projectName, ticket.id, ticket.parentEpicId)
+
+  const statusQ = useQuery({
+    queryKey: key,
+    queryFn: () =>
+      getTicketRunStatus({
+        data: {
+          projectName: ticket.projectName,
+          ticketId: ticket.id,
+          parentEpicId: ticket.parentEpicId,
+        },
+      }),
+    refetchInterval: POLL_INTERVAL_MS,
+    refetchIntervalInBackground: false,
+    enabled: runnable,
+  })
+
+  // `reason` from a refused start (started:false — already-running / unknown-project
+  // / ticket-not-found). Distinct from a failed RUN, so it's a transient note in the
+  // chip title, never styled as failed. Cleared on the next successful start.
+  const [refusal, setRefusal] = useState<string | null>(null)
+
+  const run = useMutation({
+    mutationFn: () =>
+      startTicketRun({
+        data: {
+          projectName: ticket.projectName,
+          ticketId: ticket.id,
+          parentEpicId: ticket.parentEpicId,
+          // createPr omitted → server defaults it to true (the "--pr" behavior).
+        },
+      }),
+    onSuccess: (res) => {
+      if (res.started) {
+        setRefusal(null)
+        // startGuardedTicketRun is terminal-on-return in dry-run, so res.status is
+        // the final status — paint it immediately, no second poll needed.
+        if (res.status) qc.setQueryData(key, res.status)
+      } else {
+        setRefusal(res.reason ?? 'could not start')
+      }
+    },
+    // Mirror SyncControl: refetch so the chip reflects disk state regardless of the
+    // optimistic setQueryData above (and once PB-15's real runs are non-terminal).
+    onSettled: () => qc.invalidateQueries({ queryKey: key }),
+  })
+
+  const status = statusQ.data ?? null
+  // While the start RPC is in flight, treat the run as running — in dry-run this is
+  // the only genuine client-side "running" window (the server writes running then
+  // succeeded before returning), giving AC8 a real running indication.
+  const running = isTicketRunRunning(status) || run.isPending
+  const busy = running || !runnable
+
+  const chip = run.isPending
+    ? { label: 'running…', variant: 'running' as const }
+    : runnable
+      ? ticketRunChip(status, now)
+      : { label: 'run n/a', variant: 'idle' as const }
+
+  // Tooltip surfaces the most useful detail without bloating the chip text.
+  const title = !runnable
+    ? 'This ticket can’t be run (degraded metadata or invalid id).'
+    : run.isError
+      ? 'Could not reach the server to start the run.'
+      : (refusal && !run.isPending ? `Couldn’t start: ${refusal}` : null) ??
+        status?.error ??
+        status?.logTail ??
+        status?.prUrl ??
+        'Run /feature:flow --pr for this ticket'
+
+  return (
+    <div className="run">
+      <button
+        type="button"
+        className="primary run-btn"
+        onClick={() => run.mutate()}
+        disabled={busy}
+        aria-busy={running}
+        aria-label={`Run Flow --pr for ${ticket.id}`}
+        title={title}
+      >
+        Run Flow --pr
+      </button>
+      <span
+        className={`run-chip run-chip-${chip.variant}${run.isError ? ' run-chip-fail' : ''}`}
+        title={title}
+        aria-live="polite"
+      >
+        {run.isError ? 'start failed' : chip.label}
+      </span>
+    </div>
   )
 }

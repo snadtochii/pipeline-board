@@ -461,6 +461,156 @@ function spawnFlow(project: Project, ticketId: string, createPr: boolean): Promi
   })
 }
 
+// ── Git isolation (PB-19) ─────────────────────────────────────────────────────
+// SERVER-ONLY plain-git machinery, cloned from spawnFlow's never-throw spawn shape.
+// Reached only from startGuardedTicketRun (clean-tree gate) and runRealFlow (branch
+// isolate/restore) — both handler-body exports, never the client bundle. The board's
+// OWN git invocations (vs the `claude` allowlist, which governs the spawned flow): a
+// live run forks a dedicated `pb-run/<runId>` branch off the default branch before
+// spawning flow, so its work never lands on main/the user's branch (PB-16 stranding),
+// and on every terminal path the original branch + a clean tree are restored, with
+// partial work committed to the run branch — never left uncommitted on the user's branch.
+
+/** Per-git-command kill cap. Git plumbing is fast; sized generously so a slow disk/large
+ *  repo can't trip it, yet bounded so a wedged git can never hang the runner. */
+const GIT_TIMEOUT_MS = 60_000
+
+interface GitResult {
+  code: number | null
+  stdout: string
+  stderr: string
+  spawnError?: Error
+}
+
+/**
+ * Run one `git` command in `cwd` and capture exit code + trimmed stdout/stderr. Clone of spawnFlow's
+ * never-throw shape: ignores stdin, resolves on `close`/`error` (ENOENT → `spawnError`, e.g. `git`
+ * not on PATH), and a `timeout` SIGTERMs a wedged command. Args are passed as an array (no shell),
+ * so no untrusted string is ever interpolated into a command line — there is no injection surface.
+ * Internal — the higher-level helpers built on it are what tests exercise (against temp repos).
+ */
+function runGit(cwd: string, args: string[]): Promise<GitResult> {
+  return new Promise<GitResult>((resolve) => {
+    const child = spawn('git', args, {
+      cwd,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: GIT_TIMEOUT_MS,
+      killSignal: 'SIGTERM',
+    })
+    // Cap capture like spawnFlow — git plumbing output is tiny, but a pathological repo (huge
+    // status) shouldn't balloon memory; the trailing tail is what callers ever read.
+    let stdout = ''
+    let stderr = ''
+    child.stdout?.on('data', (d: Buffer) => {
+      stdout += d.toString()
+      if (stdout.length > MAX_CAPTURE) stdout = stdout.slice(-MAX_CAPTURE)
+    })
+    child.stderr?.on('data', (d: Buffer) => {
+      stderr += d.toString()
+      if (stderr.length > MAX_CAPTURE) stderr = stderr.slice(-MAX_CAPTURE)
+    })
+    child.on('error', (err) => {
+      resolve({ code: null, stdout, stderr, spawnError: err })
+    })
+    child.on('close', (code) => {
+      resolve({ code, stdout: stdout.trim(), stderr: stderr.trim() })
+    })
+  })
+}
+
+/**
+ * The short default-branch name to fork a run branch from. Mirrors feature-pipeline's own
+ * pr-creation.md §1 base detection (`git symbolic-ref --short refs/remotes/origin/HEAD` → strip the
+ * `origin/` prefix), so the runner's fork point aligns with the base flow opens its PR against.
+ * Falls back to `'main'` when `origin/HEAD` isn't configured (local-only repo) — matching flow's
+ * `|| echo main`. No `git fetch` first: the fork point only needs the local default ref; flow itself
+ * fetches at PR time.
+ */
+export async function defaultBranch(cwd: string): Promise<string> {
+  const r = await runGit(cwd, ['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'])
+  if (r.code === 0 && r.stdout) {
+    return r.stdout.replace(/^origin\//, '')
+  }
+  return 'main'
+}
+
+/**
+ * The ref to restore HEAD to after a run: the current branch name, or — when HEAD is detached —
+ * the commit SHA, so a run that started in detached HEAD is still restored to exactly where it was.
+ * Returns null only when git can't be queried at all (not a repo / `git` missing), letting callers
+ * fail legibly rather than checkout an empty ref.
+ */
+export async function currentRef(cwd: string): Promise<string | null> {
+  const branch = await runGit(cwd, ['rev-parse', '--abbrev-ref', 'HEAD'])
+  if (branch.code !== 0) return null
+  if (branch.stdout && branch.stdout !== 'HEAD') return branch.stdout
+  // Detached HEAD — restore by SHA so we land back on the exact commit.
+  const sha = await runGit(cwd, ['rev-parse', 'HEAD'])
+  if (sha.code === 0 && sha.stdout) return sha.stdout
+  return null
+}
+
+/**
+ * True iff the working tree is clean — `git status --porcelain` exits 0 with empty output.
+ * `--porcelain` omits gitignored paths by default, so the ticket folder under gitignored
+ * `claudedocs/` never counts as dirty and flow's mid-run folder moves never dirty the tree (AC1+AC4
+ * are compatible only because of this). A non-repo / unqueryable tree is reported NOT clean, so a
+ * live run there refuses to start with a clear reason rather than forking into a non-repo.
+ */
+export async function isTreeClean(cwd: string): Promise<boolean> {
+  const r = await runGit(cwd, ['status', '--porcelain'])
+  return r.code === 0 && r.stdout === ''
+}
+
+/**
+ * The dedicated per-run branch name. Derived from the (server-generated, path-safe, unique) runId,
+ * so two runs can never collide on the branch name (`git checkout -b` would fail on a dup). The
+ * `pb-run/` prefix namespaces it away from user/flow branches.
+ */
+export function runBranchName(runId: string): string {
+  return `pb-run/${runId}`
+}
+
+/**
+ * Stage + commit any partial work onto the CURRENT branch (the run branch, or flow's own feature
+ * branch if it forked further), then restore HEAD to `originalRef`. Best-effort and never throws:
+ *  - `git add -A` provably excludes gitignored files, so `.env`/`node_modules`/`claudedocs/` are
+ *    never committed (AC4 — they stay present + untouched in the tree). When `claudedocs/` is
+ *    *tracked* (a consumer that doesn't gitignore it), exclude it explicitly so internal ticket
+ *    bookkeeping isn't swept into the run commit (mirrors pr-creation.md §3).
+ *  - "nothing to commit" is benign (a clean run / flow already committed) — skipped, not an error.
+ *  - the restoring `git checkout <originalRef>` always runs; if it fails after a commit, the work is
+ *    safe on the run branch — the caller surfaces the failure in the terminal status rather than
+ *    silently leaving the user on the run branch.
+ * Returns a human-readable note when something noteworthy happened (a failed restore), else null.
+ * Exported for unit testing against an isolated temp repo (the live spawn path is manually verified).
+ */
+export async function preserveAndRestore(cwd: string, originalRef: string): Promise<string | null> {
+  // Stage everything except gitignored paths; additionally drop a *tracked* claudedocs/ tree.
+  const ignored = await runGit(cwd, ['check-ignore', '-q', 'claudedocs'])
+  await runGit(cwd, ['add', '-A'])
+  if (ignored.code !== 0) {
+    // claudedocs/ is NOT gitignored (tracked in this repo) → unstage it so run commits stay clean.
+    await runGit(cwd, ['reset', '-q', '--', 'claudedocs'])
+  }
+  // Commit partial work; "nothing to commit" exits non-zero and is benign. `--no-verify` so a
+  // consumer repo's pre-commit hook can't block this mechanical preservation commit (which would
+  // strand the work uncommitted before restore).
+  await runGit(cwd, [
+    'commit',
+    '--no-verify',
+    '-m',
+    `pipeline-board run: partial work (${originalRef})`,
+  ])
+  // `--` end-of-options separator: defense-in-depth so an originalRef can never be parsed as a flag
+  // (git already forbids leading-dash branch names, and the SHA path can't start with `-`).
+  const restore = await runGit(cwd, ['checkout', originalRef, '--'])
+  if (restore.code !== 0) {
+    return `could not restore original branch ${originalRef}: ${restore.stderr || 'git checkout failed'} — partial work is preserved on the run branch`
+  }
+  return null
+}
+
 // ── Guarded start (orchestration) ─────────────────────────────────────────────
 
 export interface StartTicketRunOptions {
@@ -471,9 +621,10 @@ export interface StartTicketRunOptions {
 export interface StartTicketRunResult {
   started: boolean
   /**
-   * Why a start was refused; absent on success. This helper emits only
-   * `already-running`; the startTicketRun server fn adds `unknown-project` and
-   * `ticket-not-found` from its boundary checks (shared single contract).
+   * Why a start was refused; absent on success. This helper emits `already-running`,
+   * `project-busy` (live, a concurrent real flow in the repo), and `dirty-tree` (live,
+   * the working tree has uncommitted changes — PB-19); the startTicketRun server fn adds
+   * `unknown-project` and `ticket-not-found` from its boundary checks (shared single contract).
    */
   reason?: string
   /** The persisted status on a successful start (PB-14 renders it without a second poll). */
@@ -528,6 +679,14 @@ export async function startGuardedTicketRun(
     // Per-project lock applies to REAL runs only — a concurrent real flow in the same repo would race.
     const busy = await findActiveRealRunForProject(project.name)
     if (busy) return { started: false, reason: 'project-busy' }
+    // Clean-tree precondition (PB-19, live only): refuse to start unless the working tree is clean,
+    // so a run never mixes with or strands the user's in-flight edits. It's process/fs state (same
+    // category as the per-project lock), not input validation — so it lives here, not at the
+    // server-fn validator, and refuses BEFORE the seed (no `running` run is recorded for a dirty
+    // tree). Dry runs skip it entirely: they spawn nothing and touch no git state.
+    if (!(await isTreeClean(project.path))) {
+      return { started: false, reason: 'dirty-tree' }
+    }
   }
 
   const startedAt = nowIso()
@@ -578,17 +737,25 @@ export async function startGuardedTicketRun(
  */
 async function runRealFlow(seed: TicketRunStatus, project: Project): Promise<void> {
   // The note rides logTail on EVERY terminal status (succeeded/needs-human/failed all route through
-  // finish(... , note); preflight-fail paths use `armed` directly). The second line is the honesty
-  // marker (PB-18): the headless runner always spawns flow with --no-ui-testing, so a UI ticket's
-  // `succeeded` must not be read as "browser-verified" — browser checks are deferred to human PR review.
+  // finish). The second line is the honesty marker (PB-18): the headless runner always spawns flow
+  // with --no-ui-testing, so a UI ticket's `succeeded` must not be read as "browser-verified" —
+  // browser checks are deferred to human PR review.
   const armed =
     'real run armed (PIPELINE_BOARD_ENABLE_RUNS=1)\n' +
     'browser/UI verification skipped (spawned with --no-ui-testing) — deferred to human PR review'
 
-  const finish = async (
-    patch: Partial<TicketRunStatus> & { status: 'succeeded' | 'failed' | 'needs-human' },
-    note: string,
-  ): Promise<void> => {
+  // A terminal status is a patch + a note; the branch-restore step can append to both (e.g. a
+  // restore failure), so we build the patch first and write once, after restore has run.
+  type TerminalPatch = Partial<TicketRunStatus> & {
+    status: 'succeeded' | 'failed' | 'needs-human'
+  }
+
+  // Captured during the spawn try-block, read after the finally restore — the terminal write folds
+  // both in. Declared here so the finally and the post-finally compose can see them.
+  let rawTail = ''
+  let restoreNote: string | null = null
+
+  const finish = async (patch: TerminalPatch, note: string): Promise<void> => {
     const terminal: TicketRunStatus = {
       ...seed,
       updatedAt: nowIso(),
@@ -605,6 +772,8 @@ async function runRealFlow(seed: TicketRunStatus, project: Project): Promise<voi
 
   // Pre-flight: the dir + feature-pipeline shape could have vanished between the boundary's
   // ticketExists check and now — surface a legible `failed` rather than an opaque child error.
+  // These run BEFORE any branch is created, so a preflight failure restores nothing (HEAD unmoved)
+  // and tests pointing project.path at a non-workspace dir still short-circuit without git/spawn.
   try {
     const dirStat = await fs.stat(project.path)
     if (!dirStat.isDirectory()) {
@@ -625,31 +794,78 @@ async function runRealFlow(seed: TicketRunStatus, project: Project): Promise<voi
     return
   }
 
-  const r = await spawnFlow(project, seed.ticketId, seed.createPr)
-  const raw = tail(r.stdout + (r.stderr ? `\n[stderr]\n${r.stderr}` : ''))
-  const note = raw ? `${armed}\n${raw}` : armed
-
-  if (r.spawnError) {
-    const why =
-      (r.spawnError as NodeJS.ErrnoException).code === 'ENOENT'
-        ? "'claude' CLI not found on PATH"
-        : `spawn failed: ${r.spawnError.message}`
-    await finish({ status: 'failed', error: why }, note)
-    return
-  }
-  if (r.code === 0) {
-    await finish(classifyCode0(parseFlowReport(r.stdout) ?? undefined, seed.createPr), note)
-    return
-  }
-  if (r.code === null && r.signal) {
+  // ── Branch isolation (PB-19) ────────────────────────────────────────────────
+  // Record the user's current ref, then fork a dedicated `pb-run/<runId>` branch off the default
+  // branch BEFORE spawning flow, so the run's edits never accumulate on main/the user's branch.
+  // On EVERY terminal path (success, failure, timeout, or a thrown error) the finally restores the
+  // original ref and preserves partial work on the run branch (commit-then-checkout, never discard).
+  const original = await currentRef(project.path)
+  if (!original) {
     await finish(
-      {
-        status: 'failed',
-        error: `killed (${r.signal}) — likely timed out after ${Math.round(RUN_TIMEOUT_MS / 60_000)}m`,
-      },
-      note,
+      { status: 'failed', error: 'could not read current git branch (not a git repo?)' },
+      armed,
     )
     return
   }
-  await finish({ status: 'failed', error: `flow exited with code ${r.code}` }, note)
+  const base = await defaultBranch(project.path)
+  const branch = runBranchName(seed.runId)
+  const created = await runGit(project.path, ['checkout', '-b', branch, base])
+  if (created.code !== 0) {
+    // Branch create failed — HEAD is unmoved, so nothing to restore. Surface a legible failure.
+    // A spawnError (e.g. ENOENT) means `git` isn't on PATH — say so rather than show an empty stderr.
+    const why = created.spawnError
+      ? ((created.spawnError as NodeJS.ErrnoException).code === 'ENOENT'
+          ? "'git' not found on PATH"
+          : `git spawn failed: ${created.spawnError.message}`)
+      : created.stderr || 'git checkout -b failed'
+    await finish(
+      { status: 'failed', error: `could not create run branch ${branch} off ${base}: ${why}` },
+      armed,
+    )
+    return
+  }
+
+  let patch: TerminalPatch
+  try {
+    const r = await spawnFlow(project, seed.ticketId, seed.createPr)
+    const raw = tail(r.stdout + (r.stderr ? `\n[stderr]\n${r.stderr}` : ''))
+    // Stash the captured output so the (post-restore) write carries it on logTail.
+    rawTail = raw
+    if (r.spawnError) {
+      const why =
+        (r.spawnError as NodeJS.ErrnoException).code === 'ENOENT'
+          ? "'claude' CLI not found on PATH"
+          : `spawn failed: ${r.spawnError.message}`
+      patch = { status: 'failed', error: why }
+    } else if (r.code === 0) {
+      patch = classifyCode0(parseFlowReport(r.stdout) ?? undefined, seed.createPr)
+    } else if (r.code === null && r.signal) {
+      patch = {
+        status: 'failed',
+        error: `killed (${r.signal}) — likely timed out after ${Math.round(RUN_TIMEOUT_MS / 60_000)}m`,
+      }
+    } else {
+      patch = { status: 'failed', error: `flow exited with code ${r.code}` }
+    }
+  } catch (err) {
+    // Defensive: spawnFlow never throws, but a future change might — classify rather than strand.
+    patch = { status: 'failed', error: `run error: ${(err as Error).message}` }
+  } finally {
+    // ALWAYS preserve partial work onto the run branch and restore the user's original ref.
+    restoreNote = await preserveAndRestore(project.path, original)
+  }
+
+  // Compose the final logTail: armed preamble + restore note (if any) + captured output tail.
+  const parts = [armed]
+  if (restoreNote) parts.push(restoreNote)
+  if (rawTail) parts.push(rawTail)
+  const note = parts.join('\n')
+  // A restore failure left the tree on the run branch — fold it into `error` so it isn't read as a
+  // clean success (the work is safe on the run branch, but the user wasn't returned to their branch).
+  if (restoreNote && patch.status === 'succeeded') {
+    patch = { ...patch, status: 'needs-human', error: restoreNote }
+  } else if (restoreNote && !patch.error) {
+    patch = { ...patch, error: restoreNote }
+  }
+  await finish(patch, note)
 }

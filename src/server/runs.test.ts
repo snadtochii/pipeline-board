@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { promises as fs } from 'node:fs'
+import { promises as fs, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -7,13 +8,18 @@ import {
   RUN_STALE_MS,
   buildFlowArgs,
   classifyCode0,
+  currentRef,
+  defaultBranch,
   isTicketRunAction,
   isTicketRunRunning,
   isTicketRunStatus,
+  isTreeClean,
   makeRunId,
   parseFlowReport,
+  preserveAndRestore,
   readLatestTicketRun,
   readTicketRunStatus,
+  runBranchName,
   startGuardedTicketRun,
   ticketRunKey,
   writeTicketRunStatus,
@@ -23,6 +29,44 @@ import type { Project, TicketRunStatus } from './types'
 const project: Project = { name: 'Pipeline Board', path: '/tmp/does-not-matter' }
 
 let dir: string
+
+// ── Temp git-repo harness (PB-19) ─────────────────────────────────────────────
+// The branch-isolation feature runs REAL git on project.path. These tests must never
+// touch the real working tree — every git op targets an isolated `git init`'d temp dir
+// created here and removed by the per-test cleanup. spawnSync keeps setup synchronous
+// and deterministic (no spawn of `claude` — only plumbing git on a throwaway repo).
+
+const tempRepos: string[] = []
+
+/** Run a git command synchronously in `cwd`; throw on failure so a broken fixture fails loud. */
+function git(cwd: string, ...args: string[]): string {
+  const r = spawnSync('git', args, { cwd, encoding: 'utf8' })
+  if (r.status !== 0) {
+    throw new Error(`git ${args.join(' ')} failed in ${cwd}: ${r.stderr || r.stdout}`)
+  }
+  return r.stdout.trim()
+}
+
+/**
+ * Create an isolated git repo in a fresh temp dir with one initial commit on branch `main`, local
+ * identity config (so commits work in CI), and `claudedocs/` gitignored (mirrors this repo). Tracked
+ * by `tempRepos` for cleanup. Optionally seed extra files. Returns the absolute repo path.
+ */
+function initTempGitRepo(opts: { gitignoreClaudedocs?: boolean } = {}): string {
+  const repo = mkdtempSync(join(tmpdir(), 'pb-gitrepo-'))
+  tempRepos.push(repo)
+  // -b main: deterministic default branch regardless of the host's init.defaultBranch.
+  git(repo, 'init', '-b', 'main')
+  git(repo, 'config', 'user.email', 'test@example.com')
+  git(repo, 'config', 'user.name', 'PB Test')
+  if (opts.gitignoreClaudedocs ?? true) {
+    writeFileSync(join(repo, '.gitignore'), 'claudedocs/\nnode_modules/\n.env\n', 'utf8')
+  }
+  writeFileSync(join(repo, 'README.md'), '# fixture\n', 'utf8')
+  git(repo, 'add', '-A')
+  git(repo, 'commit', '-m', 'initial')
+  return repo
+}
 
 beforeEach(async () => {
   dir = await fs.mkdtemp(join(tmpdir(), 'pb-runs-'))
@@ -34,6 +78,10 @@ afterEach(async () => {
   delete process.env.PIPELINE_BOARD_CONFIG_DIR
   // PB-15 gate tests set this; clear it so it never leaks into a later test (which would arm a real spawn).
   delete process.env.PIPELINE_BOARD_ENABLE_RUNS
+  // PB-19: remove every temp git repo created this test (isolation — never the real tree).
+  while (tempRepos.length > 0) {
+    rmSync(tempRepos.pop() as string, { recursive: true, force: true })
+  }
 })
 
 const runsDir = (): string => join(dir, 'runs')
@@ -453,13 +501,17 @@ describe('env gate (PIPELINE_BOARD_ENABLE_RUNS)', () => {
 })
 
 describe('per-project real-flow lock', () => {
-  // `project.path` ('/tmp/does-not-matter') has no claudedocs/tickets/, so any live continuation
-  // short-circuits at runRealFlow's preflight → it writes a `failed` terminal status WITHOUT ever
-  // spawning `claude`. We assert only the synchronous guard return, which is deterministic.
+  // For LIVE starts, project.path must now be a CLEAN git repo to clear PB-19's clean-tree gate; it
+  // deliberately lacks claudedocs/tickets/, so the live continuation passes the clean-tree gate, then
+  // short-circuits at runRealFlow's claudedocs/tickets/ preflight (which runs BEFORE branch creation)
+  // → writes a terminal status WITHOUT creating a run branch and WITHOUT spawning `claude`. The
+  // `project-busy` test refuses BEFORE the clean-tree gate, so it needs no repo. We assert the
+  // synchronous guard return, which is deterministic.
 
   it('refuses a second REAL flow in the same project (project-busy)', async () => {
     process.env.PIPELINE_BOARD_ENABLE_RUNS = '1'
-    // Seed an active REAL run for one ticket in the project.
+    // Seed an active REAL run for one ticket in the project. (project-busy is checked before the
+    // clean-tree gate, so the default non-repo project.path is fine here.)
     await writeTicketRunStatus(
       freshRunningRun({ runId: 'run-real', ticketId: 'PB-1', dryRun: false }),
     )
@@ -472,11 +524,13 @@ describe('per-project real-flow lock', () => {
 
   it('does NOT count a DRY running run toward the project lock', async () => {
     process.env.PIPELINE_BOARD_ENABLE_RUNS = '1'
+    const repo = initTempGitRepo()
+    const liveProject: Project = { name: 'Pipeline Board', path: repo }
     // A dry running run (dryRun: true) must not block a real start.
     await writeTicketRunStatus(
       freshRunningRun({ runId: 'run-dry', ticketId: 'PB-1', dryRun: true }),
     )
-    const res = await startGuardedTicketRun(project, 'PB-2')
+    const res = await startGuardedTicketRun(liveProject, 'PB-2')
     expect(res.started).toBe(true)
     expect(res.reason).toBeUndefined()
     expect(res.status?.dryRun).toBe(false) // armed: a real seed
@@ -484,16 +538,21 @@ describe('per-project real-flow lock', () => {
     await awaitTerminal(res.status?.runId) // let the no-spawn continuation finish before teardown
 
     // PB-18 AC3: the terminal status of a LIVE run carries the skipped-UI-testing honesty marker in
-    // logTail (here via the preflight-fail path, which uses `armed` directly — project.path has no
-    // claudedocs/tickets/). Pins the marker so a future edit to `armed` can't silently drop it.
+    // logTail (here via the claudedocs/tickets/ preflight-fail path — the repo has no tickets tree).
+    // Pins the marker so a future edit to `armed` can't silently drop it.
     const terminal = await readTicketRunStatus(res.status?.runId ?? '')
     expect(terminal?.status).not.toBe('running')
     expect(terminal?.logTail).toMatch(/--no-ui-testing/)
     expect(terminal?.logTail).toMatch(/deferred to human PR review/i)
+    // PB-19: the original branch is restored — the preflight failed before branch creation, so the
+    // repo is left exactly on `main`, never on a `pb-run/*` branch.
+    expect(git(repo, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('main')
   })
 
   it('does NOT count a STALE real run toward the project lock (coerced to failed)', async () => {
     process.env.PIPELINE_BOARD_ENABLE_RUNS = '1'
+    const repo = initTempGitRepo()
+    const liveProject: Project = { name: 'Pipeline Board', path: repo }
     const old = new Date(Date.now() - (RUN_STALE_MS + 60_000)).toISOString()
     await writeTicketRunStatus(
       freshRunningRun({
@@ -504,7 +563,7 @@ describe('per-project real-flow lock', () => {
         updatedAt: old,
       }),
     )
-    const res = await startGuardedTicketRun(project, 'PB-2')
+    const res = await startGuardedTicketRun(liveProject, 'PB-2')
     expect(res.started).toBe(true)
     expect(res.reason).toBeUndefined()
     await awaitTerminal(res.status?.runId) // let the no-spawn continuation finish before teardown
@@ -518,5 +577,258 @@ describe('per-project real-flow lock', () => {
     const res = await startGuardedTicketRun(project, 'PB-2')
     expect(res.started).toBe(true)
     expect(res.status?.dryRun).toBe(true)
+  })
+})
+
+// ── PB-19: git isolation helpers (against isolated temp repos — never the real tree) ─
+
+describe('runBranchName', () => {
+  it('namespaces the run branch under pb-run/ using the (unique) runId', () => {
+    expect(runBranchName('run-2026-06-21-abc123')).toBe('pb-run/run-2026-06-21-abc123')
+  })
+})
+
+describe('defaultBranch', () => {
+  it('falls back to main when origin/HEAD is not configured (local-only repo)', async () => {
+    const repo = initTempGitRepo()
+    // No remote → symbolic-ref refs/remotes/origin/HEAD fails → fallback.
+    expect(await defaultBranch(repo)).toBe('main')
+  })
+
+  it('resolves and strips the origin/ prefix when origin/HEAD points at a branch', async () => {
+    const repo = initTempGitRepo()
+    // Simulate a configured remote default without a network: point origin/HEAD at the local branch.
+    git(repo, 'remote', 'add', 'origin', repo)
+    git(repo, 'update-ref', 'refs/remotes/origin/main', 'HEAD')
+    git(repo, 'symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/main')
+    expect(await defaultBranch(repo)).toBe('main')
+  })
+
+  it('returns main for a non-git directory (graceful fallback, no throw)', async () => {
+    expect(await defaultBranch('/tmp')).toBe('main')
+  })
+})
+
+describe('currentRef', () => {
+  it('returns the current branch name', async () => {
+    const repo = initTempGitRepo()
+    expect(await currentRef(repo)).toBe('main')
+  })
+
+  it('returns the commit SHA when HEAD is detached', async () => {
+    const repo = initTempGitRepo()
+    const sha = git(repo, 'rev-parse', 'HEAD')
+    git(repo, 'checkout', '--detach', 'HEAD')
+    expect(await currentRef(repo)).toBe(sha)
+  })
+
+  it('returns null for a non-git directory', async () => {
+    expect(await currentRef('/tmp')).toBeNull()
+  })
+})
+
+describe('isTreeClean', () => {
+  it('is true for a freshly-committed repo', async () => {
+    const repo = initTempGitRepo()
+    expect(await isTreeClean(repo)).toBe(true)
+  })
+
+  it('is false when a tracked file has uncommitted changes', async () => {
+    const repo = initTempGitRepo()
+    writeFileSync(join(repo, 'README.md'), '# fixture changed\n', 'utf8')
+    expect(await isTreeClean(repo)).toBe(false)
+  })
+
+  it('is false when an untracked (non-ignored) file is present', async () => {
+    const repo = initTempGitRepo()
+    writeFileSync(join(repo, 'new-file.txt'), 'x\n', 'utf8')
+    expect(await isTreeClean(repo)).toBe(false)
+  })
+
+  it('stays clean when only gitignored paths change (AC1+AC4 are compatible)', async () => {
+    const repo = initTempGitRepo() // .gitignore lists claudedocs/ + node_modules/ + .env
+    writeFileSync(join(repo, '.env'), 'SECRET=1\n', 'utf8')
+    // Simulate the ticket folder living under gitignored claudedocs/ — it must not dirty the tree.
+    const claudedocs = join(repo, 'claudedocs', 'tickets', 'in-progress', 'PB-19')
+    mkdirSync(claudedocs, { recursive: true })
+    writeFileSync(join(claudedocs, '01-spec.md'), '---\nid: PB-19\n---\n', 'utf8')
+    expect(await isTreeClean(repo)).toBe(true)
+  })
+
+  it('reports a non-git directory as NOT clean (so a live run there is refused)', async () => {
+    expect(await isTreeClean('/tmp')).toBe(false)
+  })
+})
+
+// ── PB-19: clean-tree precondition at the start boundary ───────────────────────
+
+describe('clean-tree start precondition (live)', () => {
+  it('refuses a live start on a dirty tree with reason dirty-tree (no run recorded)', async () => {
+    process.env.PIPELINE_BOARD_ENABLE_RUNS = '1'
+    const repo = initTempGitRepo()
+    writeFileSync(join(repo, 'README.md'), '# dirty\n', 'utf8') // uncommitted tracked change
+    const liveProject: Project = { name: 'Pipeline Board', path: repo }
+
+    const res = await startGuardedTicketRun(liveProject, 'PB-1')
+    expect(res.started).toBe(false)
+    expect(res.reason).toBe('dirty-tree')
+    expect(res.status).toBeUndefined()
+    // No `running` run was recorded for the refused start.
+    expect(await readLatestTicketRun('Pipeline Board', 'PB-1')).toBeNull()
+    // The dirty tree was not touched (still on main, still dirty).
+    expect(git(repo, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('main')
+    expect(await isTreeClean(repo)).toBe(false)
+  })
+
+  it('allows a live start on a clean tree (gitignored-only changes do not block)', async () => {
+    process.env.PIPELINE_BOARD_ENABLE_RUNS = '1'
+    const repo = initTempGitRepo()
+    writeFileSync(join(repo, '.env'), 'SECRET=1\n', 'utf8') // gitignored — tree stays clean
+    const liveProject: Project = { name: 'Pipeline Board', path: repo }
+
+    const res = await startGuardedTicketRun(liveProject, 'PB-1')
+    expect(res.started).toBe(true)
+    expect(res.reason).toBeUndefined()
+    expect(res.status?.status).toBe('running')
+    await awaitTerminal(res.status?.runId) // drain the no-spawn continuation before teardown
+  })
+
+  it('does NOT apply the clean-tree gate to a DRY (gate-off) start on a dirty tree', async () => {
+    const repo = initTempGitRepo()
+    writeFileSync(join(repo, 'README.md'), '# dirty\n', 'utf8')
+    const dryProject: Project = { name: 'Pipeline Board', path: repo }
+    // Gate off → no git check at all; a dirty tree is irrelevant to a dry run.
+    const res = await startGuardedTicketRun(dryProject, 'PB-1')
+    expect(res.started).toBe(true)
+    expect(res.status?.dryRun).toBe(true)
+    expect(res.status?.status).toBe('succeeded')
+  })
+})
+
+// ── PB-19: branch isolation + restore around the (non-spawned) continuation ────
+
+describe('branch isolation preflight (live continuation, spawn-free)', () => {
+  // project.path is a CLEAN git repo WITHOUT claudedocs/tickets/, so runRealFlow passes the
+  // clean-tree gate, then short-circuits at the claudedocs/tickets/ preflight — which runs BEFORE
+  // branch creation, so NO pb-run/ branch is created and `claude` is never spawned. This pins the
+  // "preflight-fail restores nothing" contract. (The full branch-create+restore integration requires
+  // a real `claude` spawn and is manually verified per PB-RUN-6; preserveAndRestore — the restore
+  // core — is unit-tested directly in the suite below.)
+
+  it('short-circuits at the preflight BEFORE branch creation (no pb-run branch, HEAD unmoved)', async () => {
+    process.env.PIPELINE_BOARD_ENABLE_RUNS = '1'
+    const repo = initTempGitRepo()
+    const liveProject: Project = { name: 'Pipeline Board', path: repo }
+
+    const res = await startGuardedTicketRun(liveProject, 'PB-1')
+    expect(res.started).toBe(true)
+    await awaitTerminal(res.status?.runId)
+
+    // HEAD never left main and no pb-run/ branch exists — branch creation runs only AFTER the
+    // claudedocs/tickets/ preflight, which fails here.
+    expect(git(repo, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('main')
+    expect(git(repo, 'branch', '--list', 'pb-run/*')).toBe('')
+    const terminal = await readTicketRunStatus(res.status?.runId ?? '')
+    expect(terminal?.status).toBe('failed')
+    expect(terminal?.error).toMatch(/claudedocs\/tickets/)
+  })
+})
+
+// ── PB-19: preserveAndRestore (the failure/cleanup path, tested directly) ───────
+// The live spawn can't produce real file changes in tests (no `claude` work), so the partial-work
+// preservation contract is exercised by calling preserveAndRestore against a temp repo where we
+// simulate "the run made changes on the run branch" by hand. This is the AC3/AC4 core.
+
+describe('preserveAndRestore', () => {
+  it('commits partial work to the run branch and restores the original branch clean (AC3)', async () => {
+    const repo = initTempGitRepo()
+    const original = 'main'
+    // Simulate the runner having forked the run branch, then flow leaving partial tracked changes.
+    git(repo, 'checkout', '-b', 'pb-run/run-x')
+    writeFileSync(join(repo, 'src.txt'), 'partial work\n', 'utf8')
+
+    const note = await preserveAndRestore(repo, original)
+    expect(note).toBeNull() // clean restore
+
+    // Back on the original branch with a clean tree — no stranded uncommitted edits.
+    expect(git(repo, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('main')
+    expect(await isTreeClean(repo)).toBe(true)
+    // main never saw the partial file (it lives only on the run branch).
+    expect(spawnSync('git', ['cat-file', '-e', 'HEAD:src.txt'], { cwd: repo }).status).not.toBe(0)
+    // The partial work IS committed on the run branch.
+    expect(git(repo, 'cat-file', '-e', 'pb-run/run-x:src.txt')).toBe('')
+  })
+
+  it('never commits gitignored files (.env / node_modules stay present + untracked) (AC4)', async () => {
+    const repo = initTempGitRepo() // .gitignore has .env + node_modules/ + claudedocs/
+    git(repo, 'checkout', '-b', 'pb-run/run-y')
+    writeFileSync(join(repo, 'tracked.txt'), 'real change\n', 'utf8')
+    writeFileSync(join(repo, '.env'), 'SECRET=top\n', 'utf8') // gitignored — must NOT be committed
+
+    await preserveAndRestore(repo, 'main')
+
+    // The gitignored file is still present in the working tree after restore (AC4).
+    expect(await fs.readFile(join(repo, '.env'), 'utf8')).toBe('SECRET=top\n')
+    // It is not tracked on the run branch (git add -A excludes gitignored paths).
+    expect(spawnSync('git', ['cat-file', '-e', 'pb-run/run-y:.env'], { cwd: repo }).status).not.toBe(0)
+    // The real tracked change WAS committed to the run branch.
+    expect(git(repo, 'cat-file', '-e', 'pb-run/run-y:tracked.txt')).toBe('')
+  })
+
+  it('is a no-op-safe restore when there is nothing to commit', async () => {
+    const repo = initTempGitRepo()
+    git(repo, 'checkout', '-b', 'pb-run/run-z') // clean run branch, no changes
+    const note = await preserveAndRestore(repo, 'main')
+    expect(note).toBeNull()
+    expect(git(repo, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('main')
+    expect(await isTreeClean(repo)).toBe(true)
+  })
+
+  it('returns a note (does not throw) when the original ref cannot be checked out', async () => {
+    const repo = initTempGitRepo()
+    git(repo, 'checkout', '-b', 'pb-run/run-w')
+    writeFileSync(join(repo, 'src.txt'), 'work\n', 'utf8')
+    // Restore target does not exist → checkout fails; work must stay safe on the run branch.
+    const note = await preserveAndRestore(repo, 'no-such-branch')
+    expect(note).toMatch(/could not restore/i)
+    // Still on the run branch (work preserved), not stranded/lost.
+    expect(git(repo, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('pb-run/run-w')
+    expect(git(repo, 'cat-file', '-e', 'pb-run/run-w:src.txt')).toBe('')
+  })
+
+  it('restores a non-main original branch (user was on a feature branch) clean (AC3)', async () => {
+    const repo = initTempGitRepo()
+    // The user started on a feature branch; the runner forked the run branch off it. Restore must
+    // return to feature/my-work, not main — this is the genuine non-main restore path.
+    git(repo, 'checkout', '-b', 'feature/my-work')
+    git(repo, 'checkout', '-b', 'pb-run/run-feat')
+    writeFileSync(join(repo, 'src.txt'), 'partial work\n', 'utf8')
+
+    const note = await preserveAndRestore(repo, 'feature/my-work')
+    expect(note).toBeNull()
+    expect(git(repo, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('feature/my-work')
+    expect(await isTreeClean(repo)).toBe(true)
+    // feature/my-work never saw the partial file; it lives only on the run branch.
+    expect(spawnSync('git', ['cat-file', '-e', 'feature/my-work:src.txt'], { cwd: repo }).status).not.toBe(0)
+    expect(git(repo, 'cat-file', '-e', 'pb-run/run-feat:src.txt')).toBe('')
+  })
+
+  it('excludes a TRACKED claudedocs/ tree from the partial-work commit', async () => {
+    // A consumer repo that does NOT gitignore claudedocs/ — the runner must still keep ticket
+    // bookkeeping out of the run commit (the tracked-claudedocs `git reset` branch).
+    const repo = initTempGitRepo({ gitignoreClaudedocs: false })
+    mkdirSync(join(repo, 'claudedocs'), { recursive: true })
+    writeFileSync(join(repo, 'claudedocs', 'notes.md'), 'bookkeeping\n', 'utf8')
+    git(repo, 'add', '-A')
+    git(repo, 'commit', '-m', 'track claudedocs')
+    git(repo, 'checkout', '-b', 'pb-run/run-cd')
+    writeFileSync(join(repo, 'src.txt'), 'real change\n', 'utf8')
+    writeFileSync(join(repo, 'claudedocs', 'notes.md'), 'CHANGED bookkeeping\n', 'utf8')
+
+    await preserveAndRestore(repo, 'main')
+
+    // The real change was committed to the run branch; the tracked claudedocs change was NOT.
+    expect(git(repo, 'cat-file', '-e', 'pb-run/run-cd:src.txt')).toBe('')
+    expect(git(repo, 'show', 'pb-run/run-cd:claudedocs/notes.md')).toBe('bookkeeping')
   })
 })

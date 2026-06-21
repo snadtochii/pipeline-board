@@ -151,7 +151,10 @@ export function DetailPanel({
             {content.staleFolder && <span className="warn">⚠ stale folder</span>}
           </div>
 
-          <RunFlowControl ticket={content} />
+          <RunFlowControl
+            key={`${content.projectName}:${content.parentEpicId ?? ''}:${content.id}`}
+            ticket={content}
+          />
 
           {content.tags.length > 0 && (
             <div className="detail-tags">
@@ -199,10 +202,11 @@ export function DetailPanel({
  * mutation + polled-status + optimistic-invalidate pattern, scoped to one ticket.
  *
  * Always rendered with a non-null `ticket` (the panel's `content`), so its hooks
- * run unconditionally — no conditional-hook hazard. The query/mutation key off the
- * passed ticket; on a panel swap React keeps this same component instance but the
- * query key changes (project + parentEpicId + leaf id), so the chip auto-reflects
- * the newly-keyed ticket's run (or "no runs yet") with no manual reset.
+ * run unconditionally — no conditional-hook hazard. The parent gives it a
+ * ticket-scoped React `key` (project + parentEpicId + leaf id), so switching the
+ * open ticket REMOUNTS this control: the run mutation, refusal note, and local
+ * clock all reset to a clean slate instead of carrying the previous ticket's
+ * in-flight/optimistic state across the swap.
  *
  * Imports only RPC stubs from functions.ts and pure helpers from src/lib — no
  * runs.ts/scanner.ts import, so no node:* leaks into the client bundle.

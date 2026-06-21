@@ -2,6 +2,7 @@ import { defineConfig } from 'vite'
 import { tanstackStart } from '@tanstack/react-start/plugin/vite'
 import { nitro } from 'nitro/vite'
 import viteReact from '@vitejs/plugin-react'
+import pkg from './package.json'
 
 // Plugin order matters: tanstackStart() first (route generation + SSR entry wiring),
 // then nitro() so the production build emits a runnable Node server at
@@ -17,4 +18,7 @@ import viteReact from '@vitejs/plugin-react'
 export default defineConfig({
   server: { port: 3000 },
   plugins: [tanstackStart(), nitro(), viteReact()],
+  define: {
+    __APP_VERSION__: JSON.stringify(pkg.version),
+  },
 })

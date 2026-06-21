@@ -198,6 +198,27 @@ export function DetailPanel({
 }
 
 /**
+ * Map a refused-start `reason` (started:false) to a human-readable note for the chip tooltip.
+ * Unknown reasons fall through to the raw string so a future reason never shows as blank.
+ */
+function refusalMessage(reason: string): string {
+  switch (reason) {
+    case 'already-running':
+      return 'a run is already in progress for this ticket'
+    case 'project-busy':
+      return 'another live run is active in this project'
+    case 'dirty-tree':
+      return 'the project has uncommitted changes — commit or stash them first'
+    case 'unknown-project':
+      return 'this project is no longer configured'
+    case 'ticket-not-found':
+      return 'this ticket no longer exists on disk'
+    default:
+      return reason
+  }
+}
+
+/**
  * Per-ticket "Run Flow --pr" control + status chip (PB-14). Mirrors SyncControl's
  * mutation + polled-status + optimistic-invalidate pattern, scoped to one ticket.
  *
@@ -245,9 +266,10 @@ function RunFlowControl({ ticket }: { ticket: TicketDTO }) {
     enabled: runnable,
   })
 
-  // `reason` from a refused start (started:false — already-running / unknown-project
-  // / ticket-not-found). Distinct from a failed RUN, so it's a transient note in the
-  // chip title, never styled as failed. Cleared on the next successful start.
+  // `reason` from a refused start (started:false — already-running / project-busy /
+  // dirty-tree / unknown-project / ticket-not-found). Distinct from a failed RUN, so
+  // it's a transient note in the chip title (via refusalMessage), never styled as
+  // failed. Cleared on the next successful start.
   const [refusal, setRefusal] = useState<string | null>(null)
 
   const run = useMutation({
@@ -293,7 +315,7 @@ function RunFlowControl({ ticket }: { ticket: TicketDTO }) {
     ? 'This ticket can’t be run (degraded metadata or invalid id).'
     : run.isError
       ? 'Could not reach the server to start the run.'
-      : (refusal && !run.isPending ? `Couldn’t start: ${refusal}` : null) ??
+      : (refusal && !run.isPending ? `Couldn’t start: ${refusalMessage(refusal)}` : null) ??
         status?.error ??
         status?.logTail ??
         status?.prUrl ??

@@ -147,3 +147,43 @@ export interface SyncRunStatus {
   status: SyncRunState
   workspaces: SyncWorkspaceStatus[]
 }
+
+// ── Per-ticket flow runner (PB-12) ───────────────────────────────────────────
+// Status of a board-triggered `/feature:flow <id> --pr` run for a single ticket.
+// Persisted (atomically) under ~/.pipeline-board/runs/<runId>.json by runs.ts and
+// resolved via a latest.json index — app state, not ticket data, so (like the
+// Sync* block) it never travels through the TicketSource seam. Mirrors the Sync*
+// shapes but scoped to one ticket: a per-run record keyed by runId, a `succeeded`
+// (not `done`) terminal vocabulary, and an `updatedAt` stamp the orchestrator
+// bumps on progress (a single run has no per-workspace stamps to derive freshness
+// from).
+
+/** The pipeline action a run drives. Single-valued in v1; widens when Prepare/Review-PR land. */
+export type TicketRunAction = 'flow'
+
+/** Overall run state. A `running` older than the staleness threshold reads as `failed`. */
+export type TicketRunState = 'running' | 'succeeded' | 'failed'
+
+export interface TicketRunStatus {
+  runId: string
+  /** Ticket identity (mirrors TicketDTO) — the trio that keys the run on disk. */
+  projectName: string
+  ticketId: string
+  parentEpicId?: string
+  action: TicketRunAction
+  /** True when no agent was spawned (the default until the server is env-armed for live runs). */
+  dryRun: boolean
+  /** Whether the run requests a PR (`--pr`); always true in v1. */
+  createPr: boolean
+  status: TicketRunState
+  /** ISO timestamps. `updatedAt` is bumped on progress so a legitimately long run stays "fresh". */
+  startedAt: string
+  updatedAt: string
+  finishedAt: string | null
+  /** PR URL parsed from a successful flow report, when present. */
+  prUrl?: string
+  /** Tail of run output, or a note (e.g. "dry run — no agent spawned"). */
+  logTail?: string
+  /** Failure reason when state is `failed`. */
+  error?: string
+}

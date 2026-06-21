@@ -13,7 +13,7 @@ export function isTicketRunRunning(status: TicketRunStatus | null): boolean {
 }
 
 /** Visual variant for the chip, so styling stays out of the label string. */
-export type TicketRunChipVariant = 'idle' | 'running' | 'ok' | 'fail'
+export type TicketRunChipVariant = 'idle' | 'running' | 'ok' | 'fail' | 'attention'
 
 export interface TicketRunChip {
   label: string
@@ -24,9 +24,10 @@ export interface TicketRunChip {
  * Map a (possibly null) run status to a compact chip label + variant. `now`
  * (epoch ms) is injected for the relative time so the function stays pure/testable.
  *
- * - null            → "no runs yet"        (idle)   — ticket never run
+ * - null            → "no runs yet"        (idle)      — ticket never run
  * - running         → "running…"           (running)
- * - succeeded       → "succeeded <rel>"    (ok)     — rel omitted if unparseable
+ * - succeeded       → "succeeded <rel>"    (ok)        — rel omitted if unparseable
+ * - needs-human     → "needs attention <rel>" (attention) — exited 0 but produced no PR
  * - failed          → "failed <rel>"       (fail)
  *
  * Relative time keys off finishedAt ?? startedAt (mirrors SyncControl's choice).
@@ -42,7 +43,11 @@ export function ticketRunChip(
 
   const stamp = status.finishedAt ?? status.startedAt
   const rel = now === null ? '' : relativeTime(stamp, now)
-  const word = status.status === 'succeeded' ? 'succeeded' : 'failed'
-  const variant: TicketRunChipVariant = status.status === 'succeeded' ? 'ok' : 'fail'
+  const { word, variant } =
+    status.status === 'succeeded'
+      ? { word: 'succeeded', variant: 'ok' as const }
+      : status.status === 'needs-human'
+        ? { word: 'needs attention', variant: 'attention' as const }
+        : { word: 'failed', variant: 'fail' as const }
   return { label: rel ? `${word} ${rel}` : word, variant }
 }

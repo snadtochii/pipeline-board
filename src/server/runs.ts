@@ -135,7 +135,10 @@ export function isTicketRunStatus(x: unknown): x is TicketRunStatus {
     isTicketRunAction(o.action) &&
     typeof o.dryRun === 'boolean' &&
     typeof o.createPr === 'boolean' &&
-    (o.status === 'running' || o.status === 'succeeded' || o.status === 'failed') &&
+    (o.status === 'running' ||
+      o.status === 'succeeded' ||
+      o.status === 'failed' ||
+      o.status === 'needs-human') &&
     typeof o.startedAt === 'string' &&
     typeof o.updatedAt === 'string' &&
     (o.finishedAt === null || typeof o.finishedAt === 'string') &&
@@ -379,6 +382,29 @@ export function parseFlowReport(text: string): string | null {
   return m ? m[0] : null
 }
 
+/**
+ * Classify a code-0 flow result. A `createPr` run that exited 0 but produced no parseable PR URL is
+ * `needs-human`, NOT a false `succeeded` — exit 0 with no PR most often means the headless flow
+ * stalled on an interactive gate (e.g. build's browser-verification prompt) and gave up. A parsed
+ * URL is `succeeded` (+prUrl); a run that never requested a PR has no missing artifact, so no-URL is
+ * a legitimate `succeeded`. Pure + exported so the classification is unit-testable without spawning
+ * `claude` (runRealFlow's branch is unreachable in tests). The explanatory note rides `error` (the
+ * DetailPanel tooltip surfaces it first); finish() keeps the raw captured tail in logTail.
+ */
+export function classifyCode0(
+  prUrl: string | undefined,
+  createPr: boolean,
+): { status: 'succeeded' | 'needs-human'; prUrl?: string; error?: string } {
+  if (prUrl) return { status: 'succeeded', prUrl }
+  if (createPr) {
+    return {
+      status: 'needs-human',
+      error: 'flow exited 0 but produced no PR — likely blocked on an interactive gate',
+    }
+  }
+  return { status: 'succeeded' }
+}
+
 interface SpawnResult {
   code: number | null
   signal: NodeJS.Signals | null
@@ -545,7 +571,7 @@ async function runRealFlow(seed: TicketRunStatus, project: Project): Promise<voi
   const armed = 'real run armed (PIPELINE_BOARD_ENABLE_RUNS=1)'
 
   const finish = async (
-    patch: Partial<TicketRunStatus> & { status: 'succeeded' | 'failed' },
+    patch: Partial<TicketRunStatus> & { status: 'succeeded' | 'failed' | 'needs-human' },
     note: string,
   ): Promise<void> => {
     const terminal: TicketRunStatus = {
@@ -597,8 +623,7 @@ async function runRealFlow(seed: TicketRunStatus, project: Project): Promise<voi
     return
   }
   if (r.code === 0) {
-    const prUrl = parseFlowReport(r.stdout) ?? undefined
-    await finish(prUrl ? { status: 'succeeded', prUrl } : { status: 'succeeded' }, note)
+    await finish(classifyCode0(parseFlowReport(r.stdout) ?? undefined, seed.createPr), note)
     return
   }
   if (r.code === null && r.signal) {

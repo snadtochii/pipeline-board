@@ -796,6 +796,33 @@ describe('preserveAndRestore', () => {
     expect(git(repo, 'cat-file', '-e', 'pb-run/run-w:src.txt')).toBe('')
   })
 
+  it('does NOT checkout (leaving a dirty restored branch) when the partial-work commit fails', async () => {
+    // Independent-review minor: if the commit fails for a real reason (not "nothing to commit") but
+    // the checkout then succeeds, staged changes would ride onto the restored branch (AC3 violation).
+    // Force a genuine commit failure (staging still succeeds): require gpg-signing with a bogus gpg
+    // program, so `git add` works but `git commit --no-verify` exits non-zero. Assert we stay on the
+    // run branch (no carry-over onto main).
+    const repo = initTempGitRepo()
+    git(repo, 'checkout', '-b', 'pb-run/run-cf')
+    git(repo, 'config', 'commit.gpgsign', 'true')
+    git(repo, 'config', 'gpg.program', '/bin/false') // signing always fails → commit fails
+    writeFileSync(join(repo, 'src.txt'), 'work\n', 'utf8')
+
+    const note = await preserveAndRestore(repo, 'main')
+
+    expect(note).toMatch(/could not commit partial work/i)
+    // Crucially: we did NOT checkout main — so main was never made dirty by carried-over staged work.
+    expect(git(repo, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('pb-run/run-cf')
+    // The staged change is preserved on the run branch (still staged, not lost).
+    expect(git(repo, 'diff', '--cached', '--name-only')).toBe('src.txt')
+    // Disable signing, then confirm main never received the change.
+    git(repo, 'config', 'commit.gpgsign', 'false')
+    git(repo, 'stash') // park the staged change so we can switch branches to inspect main
+    git(repo, 'checkout', 'main')
+    expect(await isTreeClean(repo)).toBe(true)
+    expect(spawnSync('git', ['cat-file', '-e', 'main:src.txt'], { cwd: repo }).status).not.toBe(0)
+  })
+
   it('restores a non-main original branch (user was on a feature branch) clean (AC3)', async () => {
     const repo = initTempGitRepo()
     // The user started on a feature branch; the runner forked the run branch off it. Restore must

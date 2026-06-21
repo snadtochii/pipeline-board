@@ -593,15 +593,25 @@ export async function preserveAndRestore(cwd: string, originalRef: string): Prom
     // claudedocs/ is NOT gitignored (tracked in this repo) → unstage it so run commits stay clean.
     await runGit(cwd, ['reset', '-q', '--', 'claudedocs'])
   }
-  // Commit partial work; "nothing to commit" exits non-zero and is benign. `--no-verify` so a
-  // consumer repo's pre-commit hook can't block this mechanical preservation commit (which would
-  // strand the work uncommitted before restore).
-  await runGit(cwd, [
-    'commit',
-    '--no-verify',
-    '-m',
-    `pipeline-board run: partial work (${originalRef})`,
-  ])
+  // Distinguish "nothing to commit" from "commit genuinely failed" by the staged state, NOT by
+  // parsing the commit's stderr: `git diff --cached --quiet` exits 0 when nothing is staged, 1 when
+  // there are staged changes. If something IS staged, the commit MUST succeed before we leave this
+  // branch — otherwise `git checkout <originalRef>` would carry the still-staged changes over onto the
+  // user's branch, leaving it dirty (an AC3 violation). On a genuine commit failure we therefore skip
+  // the restore and leave the work safe on the run branch with a needs-human note.
+  const hasStaged = (await runGit(cwd, ['diff', '--cached', '--quiet'])).code !== 0
+  if (hasStaged) {
+    // `--no-verify` so a consumer repo's pre-commit hook can't block this mechanical preservation commit.
+    const committed = await runGit(cwd, [
+      'commit',
+      '--no-verify',
+      '-m',
+      `pipeline-board run: partial work (${originalRef})`,
+    ])
+    if (committed.code !== 0) {
+      return `could not commit partial work before restoring ${originalRef}: ${committed.stderr || 'git commit failed'} — work is left staged on the run branch (NOT restored, to avoid carrying changes onto your branch)`
+    }
+  }
   // `--` end-of-options separator: defense-in-depth so an originalRef can never be parsed as a flag
   // (git already forbids leading-dash branch names, and the SHA path can't start with `-`).
   const restore = await runGit(cwd, ['checkout', originalRef, '--'])

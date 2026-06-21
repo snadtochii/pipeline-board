@@ -305,9 +305,13 @@ describe('startGuardedTicketRun', () => {
 // ── PB-15: flow adapter (pure — no spawning) ──────────────────────────────────
 
 describe('buildFlowArgs', () => {
-  it('builds the /feature:flow <id> --pr vector with the runner allowlist and a capable default model', () => {
+  it('builds the /feature:flow <id> --pr --no-ui-testing vector with the runner allowlist and a capable default model', () => {
     const args = buildFlowArgs('PB-1', { createPr: true })
-    expect(args.slice(0, 3)).toEqual(['-p', '/feature:flow PB-1 --pr', '--allowedTools'])
+    expect(args.slice(0, 3)).toEqual([
+      '-p',
+      '/feature:flow PB-1 --pr --no-ui-testing',
+      '--allowedTools',
+    ])
     expect(args.slice(-2)).toEqual(['--model', 'opus'])
     // the runner's OWN broader allowlist (vs sync's narrow one)
     expect(args).toContain('Skill')
@@ -323,11 +327,17 @@ describe('buildFlowArgs', () => {
   })
 
   it('defaults createPr to true (the v1 UI always requests a PR)', () => {
-    expect(buildFlowArgs('PB-1')[1]).toBe('/feature:flow PB-1 --pr')
+    expect(buildFlowArgs('PB-1')[1]).toBe('/feature:flow PB-1 --pr --no-ui-testing')
   })
 
   it('omits --pr when createPr is false', () => {
-    expect(buildFlowArgs('PB-1', { createPr: false })[1]).toBe('/feature:flow PB-1')
+    expect(buildFlowArgs('PB-1', { createPr: false })[1]).toBe('/feature:flow PB-1 --no-ui-testing')
+  })
+
+  it('always passes --no-ui-testing (PB-18: headless runs can never browser-verify)', () => {
+    // Unconditional — present whether or not a PR is requested.
+    expect(buildFlowArgs('PB-1', { createPr: true })[1]).toContain('--no-ui-testing')
+    expect(buildFlowArgs('PB-1', { createPr: false })[1]).toContain('--no-ui-testing')
   })
 
   it('NEVER emits --dangerously-skip-permissions', () => {

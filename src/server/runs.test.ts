@@ -6,6 +6,7 @@ import {
   ALLOWED_TOOLS,
   RUN_STALE_MS,
   buildFlowArgs,
+  classifyCode0,
   isTicketRunAction,
   isTicketRunRunning,
   isTicketRunStatus,
@@ -104,6 +105,10 @@ describe('isTicketRunStatus', () => {
     expect(isTicketRunStatus(freshRunningRun())).toBe(true)
   })
 
+  it('round-trips the needs-human terminal status', () => {
+    expect(isTicketRunStatus(freshRunningRun({ status: 'needs-human' }))).toBe(true)
+  })
+
   it('rejects non-objects and wrong shapes', () => {
     expect(isTicketRunStatus(null)).toBe(false)
     expect(isTicketRunStatus({ foo: 1 })).toBe(false)
@@ -125,6 +130,7 @@ describe('isTicketRunRunning', () => {
     expect(isTicketRunRunning(null)).toBe(false)
     expect(isTicketRunRunning(freshRunningRun({ status: 'succeeded' }))).toBe(false)
     expect(isTicketRunRunning(freshRunningRun({ status: 'failed' }))).toBe(false)
+    expect(isTicketRunRunning(freshRunningRun({ status: 'needs-human' }))).toBe(false)
     expect(isTicketRunRunning(freshRunningRun())).toBe(true)
   })
 })
@@ -379,6 +385,37 @@ describe('parseFlowReport', () => {
     const text =
       'https://github.com/a/b/pull/1 then https://github.com/a/b/pull/2'
     expect(parseFlowReport(text)).toBe('https://github.com/a/b/pull/1')
+  })
+})
+
+// ── PB-17: code-0 classification (a no-PR --pr run is needs-human, not a false success) ─
+
+describe('classifyCode0', () => {
+  it('classifies a createPr run with no PR URL as needs-human (not a false success)', () => {
+    const r = classifyCode0(undefined, true)
+    expect(r.status).toBe('needs-human')
+    expect(r.error).toMatch(/no PR/i)
+    expect(r.prUrl).toBeUndefined()
+  })
+
+  it('classifies a createPr run with a parsed PR URL as succeeded', () => {
+    const r = classifyCode0('https://github.com/a/b/pull/1', true)
+    expect(r.status).toBe('succeeded')
+    expect(r.prUrl).toBe('https://github.com/a/b/pull/1')
+    expect(r.error).toBeUndefined()
+  })
+
+  it('keeps a no-PR-requested run with no URL as a legitimate succeeded', () => {
+    const r = classifyCode0(undefined, false)
+    expect(r.status).toBe('succeeded')
+    expect(r.error).toBeUndefined()
+    expect(r.prUrl).toBeUndefined()
+  })
+
+  it('stays succeeded with the prUrl even when a PR was not requested', () => {
+    const r = classifyCode0('https://github.com/a/b/pull/2', false)
+    expect(r.status).toBe('succeeded')
+    expect(r.prUrl).toBe('https://github.com/a/b/pull/2')
   })
 })
 

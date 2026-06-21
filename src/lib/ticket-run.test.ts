@@ -64,6 +64,14 @@ describe('ticketRunChip', () => {
     })
   })
 
+  it('shows "needs attention <rel>" (attention) for a needs-human run', () => {
+    const finishedAt = new Date(NOW - 4 * 60_000).toISOString()
+    expect(ticketRunChip(run({ status: 'needs-human', finishedAt }), NOW)).toEqual({
+      label: 'needs attention 4m ago',
+      variant: 'attention',
+    })
+  })
+
   it('falls back to startedAt when finishedAt is null', () => {
     const startedAt = new Date(NOW - 5 * 60_000).toISOString()
     expect(ticketRunChip(run({ status: 'succeeded', startedAt, finishedAt: null }), NOW)).toEqual({

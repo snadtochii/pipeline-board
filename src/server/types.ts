@@ -177,8 +177,12 @@ export type TicketRunAction = 'flow'
  * regex is declared once — no runs↔functions import cycle and no byte-identical clone to drift. */
 export const TICKET_ID_RE = /^[A-Z][A-Z0-9]+-\d+$/
 
-/** Overall run state. A `running` older than the staleness threshold reads as `failed`. */
-export type TicketRunState = 'running' | 'succeeded' | 'failed'
+/**
+ * Overall run state. A `running` older than the staleness threshold reads as `failed`.
+ * `needs-human` is terminal — a code-0 flow that requested a PR but produced none (likely
+ * blocked on an interactive gate); surfaced instead of a false `succeeded`.
+ */
+export type TicketRunState = 'running' | 'succeeded' | 'failed' | 'needs-human'
 
 export interface TicketRunStatus {
   runId: string

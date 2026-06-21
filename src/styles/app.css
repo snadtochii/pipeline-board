@@ -141,7 +141,8 @@ button.refresh svg {
   padding: 4px 10px;
 }
 /* nowrap + ellipsis so the status text (no runs yet / running… / succeeded 3m ago
-   / failed 5m ago) never wraps or shoves the button — the panel width is fixed. */
+   / needs attention 5m ago / failed 5m ago) never wraps or shoves the button — the
+   panel width is fixed. */
 .run-chip {
   flex: 1 1 auto;
   min-width: 0;
@@ -159,6 +160,9 @@ button.refresh svg {
 }
 .run-chip-fail {
   color: var(--danger);
+}
+.run-chip-attention {
+  color: var(--warn);
 }
 
 /* ---- layout ---- */

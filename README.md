@@ -53,8 +53,8 @@ directory so it stays out of any project tree. Override its location for testing
 - **Project filter** — show _All projects_ (columns aggregate across roots) or a single project.
 - **Detail panel** — click a card to read its `01-spec.md` and any other artifact, rendered as
   markdown in-panel.
-- **Refresh** — the board re-scans every 5 seconds (paused when the tab is hidden) and on window
-  focus; a manual **Refresh** button forces a re-scan.
+- **Auto-refresh** — the board re-scans every 5 seconds (paused when the tab is hidden) and on
+  window focus; no manual action needed.
 
 Epic folders (`prd.md` with `kind: epic`) are detected and skipped in this version; a dedicated
 epic view is future work.

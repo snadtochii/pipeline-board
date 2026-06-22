@@ -76,8 +76,6 @@ beforeEach(async () => {
 afterEach(async () => {
   await fs.rm(dir, { recursive: true, force: true })
   delete process.env.PIPELINE_BOARD_CONFIG_DIR
-  // PB-15 gate tests set this; clear it so it never leaks into a later test (which would arm a real spawn).
-  delete process.env.PIPELINE_BOARD_ENABLE_RUNS
   // PB-19: remove every temp git repo created this test (isolation — never the real tree).
   while (tempRepos.length > 0) {
     rmSync(tempRepos.pop() as string, { recursive: true, force: true })
@@ -93,7 +91,6 @@ function freshRunningRun(overrides: Partial<TicketRunStatus> = {}): TicketRunSta
     projectName: 'Pipeline Board',
     ticketId: 'PB-12',
     action: 'flow',
-    dryRun: true,
     createPr: true,
     status: 'running',
     startedAt: now,
@@ -293,24 +290,38 @@ describe('makeRunId', () => {
 })
 
 describe('startGuardedTicketRun', () => {
-  it('records a dry run: succeeded, dryRun, log note, and updates latest.json', async () => {
-    const res = await startGuardedTicketRun(project, 'PB-12')
+  // Every start is REAL now (PB-21 removed the dry path). To exercise the start path WITHOUT
+  // spawning `claude`, point project.path at a CLEAN git repo that LACKS claudedocs/tickets/ —
+  // the clean-tree gate passes, the seed writes `running`, then runRealFlow short-circuits at its
+  // claudedocs/tickets/ preflight and writes `failed` (no branch created, no `claude` spawned). The
+  // synchronous start return is deterministic (`started` + the seeded `running` status); the
+  // continuation is drained with awaitTerminal before teardown.
+
+  it('seeds a running real run and updates latest.json (no spawn — preflight short-circuits)', async () => {
+    const repo = initTempGitRepo()
+    const liveProject: Project = { name: 'Pipeline Board', path: repo }
+    const res = await startGuardedTicketRun(liveProject, 'PB-12')
     expect(res.started).toBe(true)
     expect(res.reason).toBeUndefined()
-    expect(res.status?.status).toBe('succeeded')
-    expect(res.status?.dryRun).toBe(true)
+    expect(res.status?.status).toBe('running') // fire-and-forget: the start returns the seed
     expect(res.status?.createPr).toBe(true)
-    expect(res.status?.finishedAt).not.toBeNull()
-    expect(res.status?.logTail).toMatch(/dry run/i)
+    expect(res.status?.finishedAt).toBeNull()
+    expect('dryRun' in (res.status ?? {})).toBe(false) // no vestigial dryRun field
 
-    // latest.json points at the terminal status (proves persistence + index update)
+    // latest.json points at the seeded run (proves persistence + index update)
     const latest = await readLatestTicketRun('Pipeline Board', 'PB-12')
-    expect(latest?.status).toBe('succeeded')
     expect(latest?.runId).toBe(res.status?.runId)
+
+    await awaitTerminal(res.status?.runId)
+    // The continuation wrote a terminal status (failed at the claudedocs/tickets/ preflight).
+    const terminal = await readTicketRunStatus(res.status?.runId ?? '')
+    expect(terminal?.status).toBe('failed')
+    expect(terminal?.error).toMatch(/claudedocs\/tickets/)
   })
 
   it('refuses a second run while one is genuinely running (per-ticket lock)', async () => {
-    // Seed an active run for this ticket (the lock the guard must observe).
+    // Seed an active run for this ticket (the lock the guard must observe). Checked before the
+    // clean-tree gate, so the default non-repo project.path is fine here.
     await writeTicketRunStatus(freshRunningRun({ runId: 'run-active', ticketId: 'PB-12' }))
     const res = await startGuardedTicketRun(project, 'PB-12')
     expect(res.started).toBe(false)
@@ -320,33 +331,46 @@ describe('startGuardedTicketRun', () => {
   })
 
   it('is NOT blocked by a stale running run (coerced to failed on read)', async () => {
+    const repo = initTempGitRepo()
+    const liveProject: Project = { name: 'Pipeline Board', path: repo }
     const old = new Date(Date.now() - (RUN_STALE_MS + 60_000)).toISOString()
     await writeTicketRunStatus(
       freshRunningRun({ runId: 'run-stale', ticketId: 'PB-12', startedAt: old, updatedAt: old }),
     )
-    const res = await startGuardedTicketRun(project, 'PB-12')
+    const res = await startGuardedTicketRun(liveProject, 'PB-12')
     expect(res.started).toBe(true)
-    expect(res.status?.status).toBe('succeeded')
+    expect(res.status?.status).toBe('running')
     expect(res.status?.runId).not.toBe('run-stale')
+    await awaitTerminal(res.status?.runId)
   })
 
   it('defaults createPr to true and honors createPr: false', async () => {
-    const def = await startGuardedTicketRun(project, 'PB-1')
+    // Two DISTINCT projects so neither start trips the other's per-project lock.
+    const def = await startGuardedTicketRun({ name: 'Proj A', path: initTempGitRepo() }, 'PB-1')
     expect(def.status?.createPr).toBe(true)
-    const off = await startGuardedTicketRun(project, 'PB-2', undefined, { createPr: false })
+    const off = await startGuardedTicketRun(
+      { name: 'Proj B', path: initTempGitRepo() },
+      'PB-2',
+      undefined,
+      { createPr: false },
+    )
     expect(off.status?.createPr).toBe(false)
+    await awaitTerminal(def.status?.runId)
+    await awaitTerminal(off.status?.runId)
   })
 
   it('keys an epic child separately from a same-leaf solo', async () => {
-    const child = await startGuardedTicketRun(project, 'PB-13', 'PB-11')
-    const solo = await startGuardedTicketRun(project, 'PB-13')
-    expect(child.status?.parentEpicId).toBe('PB-11')
-    expect(solo.status?.parentEpicId).toBeUndefined()
+    // Both starts hit the per-project lock (the first seeds a running run in the project), so seed
+    // each run directly to assert the KEYING, not the lock. The keying is what this test pins.
+    const child = freshRunningRun({ runId: 'run-child', ticketId: 'PB-13', parentEpicId: 'PB-11' })
+    const solo = freshRunningRun({ runId: 'run-solo', ticketId: 'PB-13' })
+    await writeTicketRunStatus(child)
+    await writeTicketRunStatus(solo)
+    expect(child.parentEpicId).toBe('PB-11')
+    expect(solo.parentEpicId).toBeUndefined()
     // Each resolves to its own latest entry — no collision.
-    expect((await readLatestTicketRun('Pipeline Board', 'PB-13', 'PB-11'))?.runId).toBe(
-      child.status?.runId,
-    )
-    expect((await readLatestTicketRun('Pipeline Board', 'PB-13'))?.runId).toBe(solo.status?.runId)
+    expect((await readLatestTicketRun('Pipeline Board', 'PB-13', 'PB-11'))?.runId).toBe('run-child')
+    expect((await readLatestTicketRun('Pipeline Board', 'PB-13'))?.runId).toBe('run-solo')
   })
 })
 
@@ -477,44 +501,20 @@ describe('classifyCode0', () => {
   })
 })
 
-// ── PB-15: env gate + per-project lock (no spawning — gate stays at dry/preflight-fail) ─
-
-describe('env gate (PIPELINE_BOARD_ENABLE_RUNS)', () => {
-  it('with the flag unset, takes the dry-run branch (dryRun, succeeded, no spawn)', async () => {
-    // flag unset by default (afterEach clears it)
-    const res = await startGuardedTicketRun(project, 'PB-1')
-    expect(res.started).toBe(true)
-    expect(res.status?.dryRun).toBe(true)
-    expect(res.status?.status).toBe('succeeded')
-    expect(res.status?.finishedAt).not.toBeNull()
-    expect(res.status?.logTail).toMatch(/dry run/i)
-  })
-
-  it('with the flag set to a non-"1" value, still dry-runs (strict exact match, fail-safe)', async () => {
-    process.env.PIPELINE_BOARD_ENABLE_RUNS = '0'
-    expect((await startGuardedTicketRun(project, 'PB-1')).status?.dryRun).toBe(true)
-    process.env.PIPELINE_BOARD_ENABLE_RUNS = 'true'
-    expect((await startGuardedTicketRun(project, 'PB-2')).status?.dryRun).toBe(true)
-    process.env.PIPELINE_BOARD_ENABLE_RUNS = ' 1 '
-    expect((await startGuardedTicketRun(project, 'PB-3')).status?.dryRun).toBe(true)
-  })
-})
+// ── PB-15/PB-21: per-project lock (always-real; no spawning — preflight short-circuits) ─
 
 describe('per-project real-flow lock', () => {
-  // For LIVE starts, project.path must now be a CLEAN git repo to clear PB-19's clean-tree gate; it
-  // deliberately lacks claudedocs/tickets/, so the live continuation passes the clean-tree gate, then
+  // Every start is real now. project.path must be a CLEAN git repo to clear PB-19's clean-tree gate;
+  // it deliberately lacks claudedocs/tickets/, so the continuation passes the clean-tree gate, then
   // short-circuits at runRealFlow's claudedocs/tickets/ preflight (which runs BEFORE branch creation)
   // → writes a terminal status WITHOUT creating a run branch and WITHOUT spawning `claude`. The
   // `project-busy` test refuses BEFORE the clean-tree gate, so it needs no repo. We assert the
   // synchronous guard return, which is deterministic.
 
-  it('refuses a second REAL flow in the same project (project-busy)', async () => {
-    process.env.PIPELINE_BOARD_ENABLE_RUNS = '1'
-    // Seed an active REAL run for one ticket in the project. (project-busy is checked before the
+  it('refuses a second flow in the same project (project-busy)', async () => {
+    // Seed an active run for one ticket in the project. (project-busy is checked before the
     // clean-tree gate, so the default non-repo project.path is fine here.)
-    await writeTicketRunStatus(
-      freshRunningRun({ runId: 'run-real', ticketId: 'PB-1', dryRun: false }),
-    )
+    await writeTicketRunStatus(freshRunningRun({ runId: 'run-real', ticketId: 'PB-1' }))
     const res = await startGuardedTicketRun(project, 'PB-2')
     expect(res.started).toBe(false)
     expect(res.reason).toBe('project-busy')
@@ -522,24 +522,18 @@ describe('per-project real-flow lock', () => {
     expect((await readLatestTicketRun('Pipeline Board', 'PB-1'))?.runId).toBe('run-real')
   })
 
-  it('does NOT count a DRY running run toward the project lock', async () => {
-    process.env.PIPELINE_BOARD_ENABLE_RUNS = '1'
+  it('starts when no other run is active, carrying the skipped-UI honesty marker (PB-18)', async () => {
     const repo = initTempGitRepo()
     const liveProject: Project = { name: 'Pipeline Board', path: repo }
-    // A dry running run (dryRun: true) must not block a real start.
-    await writeTicketRunStatus(
-      freshRunningRun({ runId: 'run-dry', ticketId: 'PB-1', dryRun: true }),
-    )
     const res = await startGuardedTicketRun(liveProject, 'PB-2')
     expect(res.started).toBe(true)
     expect(res.reason).toBeUndefined()
-    expect(res.status?.dryRun).toBe(false) // armed: a real seed
-    expect(res.status?.status).toBe('running') // live seed returns running (fire-and-forget)
+    expect(res.status?.status).toBe('running') // seed returns running (fire-and-forget)
     await awaitTerminal(res.status?.runId) // let the no-spawn continuation finish before teardown
 
-    // PB-18 AC3: the terminal status of a LIVE run carries the skipped-UI-testing honesty marker in
-    // logTail (here via the claudedocs/tickets/ preflight-fail path — the repo has no tickets tree).
-    // Pins the marker so a future edit to `armed` can't silently drop it.
+    // PB-18 AC3: the terminal status carries the skipped-UI-testing honesty marker in logTail (here
+    // via the claudedocs/tickets/ preflight-fail path — the repo has no tickets tree). Pins the
+    // marker so a future edit to `armed` can't silently drop it.
     const terminal = await readTicketRunStatus(res.status?.runId ?? '')
     expect(terminal?.status).not.toBe('running')
     expect(terminal?.logTail).toMatch(/--no-ui-testing/)
@@ -549,8 +543,7 @@ describe('per-project real-flow lock', () => {
     expect(git(repo, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('main')
   })
 
-  it('does NOT count a STALE real run toward the project lock (coerced to failed)', async () => {
-    process.env.PIPELINE_BOARD_ENABLE_RUNS = '1'
+  it('does NOT count a STALE run toward the project lock (coerced to failed)', async () => {
     const repo = initTempGitRepo()
     const liveProject: Project = { name: 'Pipeline Board', path: repo }
     const old = new Date(Date.now() - (RUN_STALE_MS + 60_000)).toISOString()
@@ -558,7 +551,6 @@ describe('per-project real-flow lock', () => {
       freshRunningRun({
         runId: 'run-stale-real',
         ticketId: 'PB-1',
-        dryRun: false,
         startedAt: old,
         updatedAt: old,
       }),
@@ -567,16 +559,6 @@ describe('per-project real-flow lock', () => {
     expect(res.started).toBe(true)
     expect(res.reason).toBeUndefined()
     await awaitTerminal(res.status?.runId) // let the no-spawn continuation finish before teardown
-  })
-
-  it('does not apply the project lock to a DRY (gate-off) start', async () => {
-    // Gate off → no per-project lock at all; a real run elsewhere is irrelevant to a dry start.
-    await writeTicketRunStatus(
-      freshRunningRun({ runId: 'run-real-2', ticketId: 'PB-1', dryRun: false }),
-    )
-    const res = await startGuardedTicketRun(project, 'PB-2')
-    expect(res.started).toBe(true)
-    expect(res.status?.dryRun).toBe(true)
   })
 })
 
@@ -662,9 +644,8 @@ describe('isTreeClean', () => {
 
 // ── PB-19: clean-tree precondition at the start boundary ───────────────────────
 
-describe('clean-tree start precondition (live)', () => {
-  it('refuses a live start on a dirty tree with reason dirty-tree (no run recorded)', async () => {
-    process.env.PIPELINE_BOARD_ENABLE_RUNS = '1'
+describe('clean-tree start precondition', () => {
+  it('refuses a start on a dirty tree with reason dirty-tree (no run recorded)', async () => {
     const repo = initTempGitRepo()
     writeFileSync(join(repo, 'README.md'), '# dirty\n', 'utf8') // uncommitted tracked change
     const liveProject: Project = { name: 'Pipeline Board', path: repo }
@@ -680,8 +661,7 @@ describe('clean-tree start precondition (live)', () => {
     expect(await isTreeClean(repo)).toBe(false)
   })
 
-  it('allows a live start on a clean tree (gitignored-only changes do not block)', async () => {
-    process.env.PIPELINE_BOARD_ENABLE_RUNS = '1'
+  it('allows a start on a clean tree (gitignored-only changes do not block)', async () => {
     const repo = initTempGitRepo()
     writeFileSync(join(repo, '.env'), 'SECRET=1\n', 'utf8') // gitignored — tree stays clean
     const liveProject: Project = { name: 'Pipeline Board', path: repo }
@@ -691,17 +671,6 @@ describe('clean-tree start precondition (live)', () => {
     expect(res.reason).toBeUndefined()
     expect(res.status?.status).toBe('running')
     await awaitTerminal(res.status?.runId) // drain the no-spawn continuation before teardown
-  })
-
-  it('does NOT apply the clean-tree gate to a DRY (gate-off) start on a dirty tree', async () => {
-    const repo = initTempGitRepo()
-    writeFileSync(join(repo, 'README.md'), '# dirty\n', 'utf8')
-    const dryProject: Project = { name: 'Pipeline Board', path: repo }
-    // Gate off → no git check at all; a dirty tree is irrelevant to a dry run.
-    const res = await startGuardedTicketRun(dryProject, 'PB-1')
-    expect(res.started).toBe(true)
-    expect(res.status?.dryRun).toBe(true)
-    expect(res.status?.status).toBe('succeeded')
   })
 })
 
@@ -716,7 +685,6 @@ describe('branch isolation preflight (live continuation, spawn-free)', () => {
   // core — is unit-tested directly in the suite below.)
 
   it('short-circuits at the preflight BEFORE branch creation (no pb-run branch, HEAD unmoved)', async () => {
-    process.env.PIPELINE_BOARD_ENABLE_RUNS = '1'
     const repo = initTempGitRepo()
     const liveProject: Project = { name: 'Pipeline Board', path: repo }
 

@@ -11,7 +11,6 @@ function run(over: Partial<TicketRunStatus> & Pick<TicketRunStatus, 'status'>): 
     projectName: over.projectName ?? 'proj',
     ticketId: over.ticketId ?? 'PB-14',
     action: 'flow',
-    dryRun: over.dryRun ?? true,
     createPr: over.createPr ?? true,
     status: over.status,
     startedAt: over.startedAt ?? '2026-06-21T11:59:00.000Z',

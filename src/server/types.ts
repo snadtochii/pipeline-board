@@ -191,8 +191,6 @@ export interface TicketRunStatus {
   ticketId: string
   parentEpicId?: string
   action: TicketRunAction
-  /** True when no agent was spawned (the default until the server is env-armed for live runs). */
-  dryRun: boolean
   /** Whether the run requests a PR (`--pr`); always true in v1. */
   createPr: boolean
   status: TicketRunState
@@ -202,7 +200,7 @@ export interface TicketRunStatus {
   finishedAt: string | null
   /** PR URL parsed from a successful flow report, when present. */
   prUrl?: string
-  /** Tail of run output, or a note (e.g. "dry run — no agent spawned"). */
+  /** Tail of run output, or a note (e.g. the armed/branch-restore preamble). */
   logTail?: string
   /** Failure reason when state is `failed`. */
   error?: string

@@ -11,7 +11,7 @@ import type { Project, TicketRunAction, TicketRunStatus } from './types.ts'
 // (PB-15) node:child_process. Reached only from functions.ts handler bodies (PB-13)
 // and tests — never from a client component (PB-1 client-bundle boundary). It
 // persists board-owned run state under ~/.pipeline-board/runs/; it never writes
-// ticket files itself — only the spawned /feature:flow (PB-15, env-gated) does.
+// ticket files itself — only the spawned /feature:flow (PB-15; always-real since PB-21) does.
 //
 // Two-file model: one runs/<runId>.json per run (history accumulates — no retention
 // in v1) plus an atomic runs/latest.json index mapping ticketRunKey → runId, so the
@@ -133,7 +133,6 @@ export function isTicketRunStatus(x: unknown): x is TicketRunStatus {
     typeof o.ticketId === 'string' &&
     (o.parentEpicId === undefined || typeof o.parentEpicId === 'string') &&
     isTicketRunAction(o.action) &&
-    typeof o.dryRun === 'boolean' &&
     typeof o.createPr === 'boolean' &&
     (o.status === 'running' ||
       o.status === 'succeeded' ||
@@ -315,18 +314,17 @@ export async function readLatestTicketRun(
 }
 
 /**
- * Find an active *real* (live, non-dry, non-stale) flow run anywhere in a project — the substrate for
- * PB-15's per-project lock (before worktrees, two real flows in the same repo would race). The
+ * Find an active (running, non-stale) flow run anywhere in a project — the substrate for the
+ * per-project lock (PB-15; before worktrees, two real flows in the same repo would race). The
  * per-ticket `latest.json` index is keyed `Project::PARENT::CHILD` with percent-encoded segments, so
  * the project name is the first `::`-segment: a key belongs to this project iff it starts with
  * `encodeURIComponent(projectName) + '::'` (the `::` separator can never occur inside an encoded
  * segment, so the prefix test is exact). Each candidate runId is resolved via readTicketRunStatus,
  * which coerces a stale `running` to `failed` for free — so a crashed run never wedges the project
- * lock. Only `running && dryRun === false` runs count (dry runs are instantaneous + side-effect-free,
- * so they take only the per-ticket guard). Returns the first such run, or null.
+ * lock. Returns the first running run, or null. (Every run is real now — PB-21 removed the dry path —
+ * so `running` is the whole predicate.)
  *
- * Reads the compact index once + one status file per project ticket (latest-only, not full history),
- * and only on a live start — the default dry-run path never calls this, so it adds zero I/O over PB-13.
+ * Reads the compact index once + one status file per project ticket (latest-only, not full history).
  */
 async function findActiveRealRunForProject(projectName: string): Promise<TicketRunStatus | null> {
   const index = await readLatestIndex()
@@ -335,7 +333,7 @@ async function findActiveRealRunForProject(projectName: string): Promise<TicketR
     if (!key.startsWith(prefix)) continue
     if (typeof runId !== 'string' || !runId) continue // corrupt-index degrade contract
     const status = await readTicketRunStatus(runId)
-    if (isTicketRunRunning(status) && status?.dryRun === false) return status
+    if (isTicketRunRunning(status)) return status
   }
   return null
 }
@@ -428,7 +426,7 @@ interface SpawnResult {
  * (`child.on('error')` → `spawnError`, e.g. ENOENT when `claude` isn't on PATH), and the spawn-level
  * `timeout` SIGTERMs a hung run. Internal — only buildFlowArgs is unit-tested; the spawn itself is
  * exercised manually under PB-RUN-6. Inherits process.env so PATH resolves `claude` and the child
- * sees CLAUDE_MODEL / PIPELINE_BOARD_ENABLE_RUNS.
+ * sees CLAUDE_MODEL.
  */
 function spawnFlow(project: Project, ticketId: string, createPr: boolean): Promise<SpawnResult> {
   const args = buildFlowArgs(ticketId, { createPr, model: process.env.CLAUDE_MODEL })
@@ -637,43 +635,37 @@ export interface StartTicketRunResult {
    * `unknown-project` and `ticket-not-found` from its boundary checks (shared single contract).
    */
   reason?: string
-  /** The persisted status on a successful start (PB-14 renders it without a second poll). */
+  /** The seeded `running` status on a successful start (PB-14 renders it without a second poll;
+   *  the 5s poll then drives the terminal progression once runRealFlow finishes). */
   status?: TicketRunStatus
-}
-
-/**
- * True only when the server was launched with `PIPELINE_BOARD_ENABLE_RUNS=1`. STRICT exact match —
- * any other value (unset, `'0'`, `'true'`, `'TRUE'`, `' 1 '`) reads as OFF, so accidental arming is
- * impossible and any ambiguity fails safe to a dry run (per the spec's default-off requirement).
- */
-function realRunsEnabled(): boolean {
-  return process.env.PIPELINE_BOARD_ENABLE_RUNS === '1'
 }
 
 /**
  * Guarded, per-ticket start used by the startTicketRun server fn.
  *
- * DEFAULT (env gate OFF — `PIPELINE_BOARD_ENABLE_RUNS` ≠ '1'): a DRY RUN exactly as in PB-13 — no
- * `claude` is spawned. Seed `running` (dryRun) synchronously → write `succeeded` with a log note →
- * both writes complete before returning (terminal-on-return).
+ * Every start spawns a REAL flow (PB-21 removed the dry-run path and the env gate): seed `running`
+ * synchronously, then fire `spawnFlow` FIRE-AND-FORGET (a real flow is up to 40m — it must not be
+ * awaited; mirrors sync's startGuardedRun) and return the seeded `running` status immediately. A
+ * `runRealFlow` continuation writes the terminal status (succeeded + prUrl / failed + error /
+ * needs-human) when the child closes; the board's 5s poll observes the transition.
  *
- * LIVE (env gate ON — PB-15): seed `running` (dryRun: false) synchronously, then fire `spawnFlow`
- * FIRE-AND-FORGET (a real flow is up to 40m — it must not be awaited; mirrors sync's startGuardedRun)
- * and return the seeded `running` status immediately. A `runRealFlow` continuation writes the terminal
- * status (succeeded + prUrl / failed + error) when the child closes; the board's 5s poll observes the
- * transition. `StartTicketRunResult` shape is identical in both branches.
- *
- * Locks (both fs-backed guards, not input validation — they live here, not at the server-fn boundary):
+ * Locks (all fs/git-backed guards, not input validation — they live here, not at the server-fn
+ * boundary):
  *  - Per-ticket: refuse `already-running` if this ticket's latest run is still `running`.
- *  - Per-project (LIVE only): refuse `project-busy` if any OTHER real flow is active in this project
- *    (before worktrees, two real flows in one repo would race). Dry runs skip this — they're instant.
+ *  - Per-project: refuse `project-busy` if any OTHER flow is active in this project (before worktrees,
+ *    two real flows in one repo would race).
+ *  - Clean-tree: refuse `dirty-tree` if the working tree has uncommitted changes (PB-19), so a run
+ *    never mixes with or strands the user's in-flight edits. Refused BEFORE the seed — no `running`
+ *    run is recorded for a dirty tree.
  *
  * KNOWN LIMITATION (carried from PB-13): the read-then-seed guard has a small TOCTOU window; the
  * per-project check widens it slightly (project-scope vs ticket-scope). Acceptable for a single-user,
  * local, user-initiated runner.
  *
  * Validation (input shape, ticket-id regex, safe-segment, project/ticket existence) belongs to the
- * server-fn boundary, NOT here — this helper stays unit-testable without the Start runtime.
+ * server-fn boundary, NOT here — this helper stays unit-testable without the Start runtime. (Tests
+ * never actually spawn `claude`: point `project.path` at a clean repo WITHOUT `claudedocs/tickets/`
+ * and runRealFlow short-circuits at its preflight, writing `failed` without spawning.)
  */
 export async function startGuardedTicketRun(
   project: Project,
@@ -684,19 +676,14 @@ export async function startGuardedTicketRun(
   const current = await readLatestTicketRun(project.name, ticketId, parentEpicId)
   if (isTicketRunRunning(current)) return { started: false, reason: 'already-running' }
 
-  const live = realRunsEnabled()
-  if (live) {
-    // Per-project lock applies to REAL runs only — a concurrent real flow in the same repo would race.
-    const busy = await findActiveRealRunForProject(project.name)
-    if (busy) return { started: false, reason: 'project-busy' }
-    // Clean-tree precondition (PB-19, live only): refuse to start unless the working tree is clean,
-    // so a run never mixes with or strands the user's in-flight edits. It's process/fs state (same
-    // category as the per-project lock), not input validation — so it lives here, not at the
-    // server-fn validator, and refuses BEFORE the seed (no `running` run is recorded for a dirty
-    // tree). Dry runs skip it entirely: they spawn nothing and touch no git state.
-    if (!(await isTreeClean(project.path))) {
-      return { started: false, reason: 'dirty-tree' }
-    }
+  // Per-project lock — a concurrent real flow in the same repo would race.
+  const busy = await findActiveRealRunForProject(project.name)
+  if (busy) return { started: false, reason: 'project-busy' }
+  // Clean-tree precondition (PB-19): refuse to start unless the working tree is clean. It's process/fs
+  // state (same category as the per-project lock), not input validation — so it lives here, not at the
+  // server-fn validator, and refuses BEFORE the seed (no `running` run is recorded for a dirty tree).
+  if (!(await isTreeClean(project.path))) {
+    return { started: false, reason: 'dirty-tree' }
   }
 
   const startedAt = nowIso()
@@ -709,7 +696,6 @@ export async function startGuardedTicketRun(
     ...(parentEpicId !== undefined ? { parentEpicId } : {}),
     ticketId,
     action: 'flow' as TicketRunAction,
-    dryRun: !live, // env gate owns real/dry; the seed's flag is truthful from the first write the poll sees
     createPr: options?.createPr ?? true,
     status: 'running',
     startedAt,
@@ -718,20 +704,7 @@ export async function startGuardedTicketRun(
   }
   await writeTicketRunStatus(seed) // synchronous lock: 'running' on disk before we return
 
-  if (!live) {
-    // DRY RUN (default) — finish terminally before returning, exactly as PB-13.
-    const finished: TicketRunStatus = {
-      ...seed,
-      status: 'succeeded',
-      updatedAt: nowIso(),
-      finishedAt: nowIso(),
-      logTail: 'env gate off — dry run; no agent spawned',
-    }
-    await writeTicketRunStatus(finished)
-    return { started: true, status: finished }
-  }
-
-  // LIVE — fire the long-running flow without awaiting; runRealFlow persists the terminal status.
+  // Fire the long-running flow without awaiting; runRealFlow persists the terminal status.
   void runRealFlow(seed, project).catch(() => {
     /* runRealFlow writes its own terminal status; the staleness backstop covers a lost write */
   })
@@ -751,7 +724,7 @@ async function runRealFlow(seed: TicketRunStatus, project: Project): Promise<voi
   // with --no-ui-testing, so a UI ticket's `succeeded` must not be read as "browser-verified" —
   // browser checks are deferred to human PR review.
   const armed =
-    'real run armed (PIPELINE_BOARD_ENABLE_RUNS=1)\n' +
+    'real run spawned (/feature:flow)\n' +
     'browser/UI verification skipped (spawned with --no-ui-testing) — deferred to human PR review'
 
   // A terminal status is a patch + a note; the branch-restore step can append to both (e.g. a

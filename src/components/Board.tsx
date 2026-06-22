@@ -7,6 +7,39 @@ import { formatVersion } from '../lib/version'
 import { loadCollapsedColumns, saveCollapsedColumns } from '../lib/collapsed-columns'
 import { STATE_FOLDERS } from '../server/types'
 import type { Column as Col, ProjectScanResult, TicketDTO } from '../server/types'
+
+/** Stable identity of the open ticket (mirrors the dismissal effect's match trio).
+ *  The panel resolves the live DTO from this each render, so it never freezes to an
+ *  open-time snapshot. */
+interface TicketIdentity {
+  projectName: string
+  id: string
+  parentEpicId?: string
+}
+
+/** Resolve a ticket's identity from a scanned DTO (what a card click captures). */
+function identityOf(t: TicketDTO): TicketIdentity {
+  return { projectName: t.projectName, id: t.id, parentEpicId: t.parentEpicId }
+}
+
+/** Find the live DTO for an identity in the latest scan, or null when it's gone. */
+function resolveSelected(
+  key: TicketIdentity | null,
+  results: ProjectScanResult[],
+): TicketDTO | null {
+  if (!key) {
+    return null
+  }
+  const project = results.find((r) => r.name === key.projectName)
+  if (!project) {
+    return null
+  }
+  return (
+    project.tickets.find(
+      (t) => t.id === key.id && t.parentEpicId === key.parentEpicId,
+    ) ?? null
+  )
+}
 import { Column } from './Column'
 import { ProjectFilter } from './ProjectFilter'
 import { SyncControl } from './SyncControl'
@@ -29,7 +62,11 @@ export function Board() {
   })
 
   const [filter, setFilter] = useState<string>('all') // 'all' | project name
-  const [selected, setSelected] = useState<TicketDTO | null>(null)
+  // The open ticket is tracked by IDENTITY (projectName + id + parentEpicId), not by a
+  // frozen DTO snapshot — so the panel re-resolves to the freshly-scanned object every
+  // 5s poll and tracks the live scan (artifacts appearing, status/column advancing).
+  // Holding the DTO value instead would freeze the panel to its open-time snapshot (PB-21).
+  const [selectedKey, setSelectedKey] = useState<TicketIdentity | null>(null)
   const [manageOpen, setManageOpen] = useState(false)
   // Collapsed columns. Starts empty (all expanded) so the first render matches
   // the server — the persisted set is read in a mount effect, never during
@@ -63,32 +100,30 @@ export function Board() {
   const results: ProjectScanResult[] = scan.data ?? []
   const projects = projectsQ.data ?? []
 
+  // Resolve the open ticket from the LIVE scan each render (PB-21). This is what makes
+  // the panel track the running flow — its artifact list and metadata block come from
+  // the freshly-scanned DTO, not a snapshot captured at click time. Reuses the existing
+  // 5s scan poll; no second query.
+  const selected = resolveSelected(selectedKey, results)
+
   // If the actively-filtered project disappears (e.g. removed via Manage projects),
   // fall back to "All" so the board doesn't render a false "no tickets" state.
   useEffect(() => {
     if (filter !== 'all' && !projects.some((p) => p.name === filter)) {
       setFilter('all')
-      setSelected(null)
+      setSelectedKey(null)
     }
   }, [projects, filter])
 
-  // Dismiss the detail panel if its ticket is gone (project removed, ticket deleted).
-  // Match on (id, parentEpicId) so a solo and an epic child sharing a leaf id —
-  // or two children of different epics — are never confused.
+  // Dismiss the detail panel if its ticket is gone (project removed, ticket deleted):
+  // when the identity no longer resolves in the live scan, clear the key so the panel
+  // closes. Same identity match as resolveSelected — a solo and an epic child sharing a
+  // leaf id (or two children of different epics) are never confused.
   useEffect(() => {
-    if (
-      selected &&
-      !results.some(
-        (r) =>
-          r.name === selected.projectName &&
-          r.tickets.some(
-            (t) => t.id === selected.id && t.parentEpicId === selected.parentEpicId,
-          ),
-      )
-    ) {
-      setSelected(null)
+    if (selectedKey && !resolveSelected(selectedKey, results)) {
+      setSelectedKey(null)
     }
-  }, [results, selected])
+  }, [results, selectedKey])
 
   const visible = filter === 'all' ? results : results.filter((r) => r.name === filter)
   const errors = visible.filter((r) => r.error)
@@ -119,7 +154,7 @@ export function Board() {
 
   const refreshFilter = (next: string) => {
     setFilter(next)
-    setSelected(null)
+    setSelectedKey(null)
   }
 
   return (
@@ -161,7 +196,7 @@ export function Board() {
                 column={col}
                 tickets={byColumn[col]}
                 showProject={showProject}
-                onSelect={setSelected}
+                onSelect={(t) => setSelectedKey(identityOf(t))}
                 collapsed={collapsed.has(col)}
                 onToggleCollapse={toggleCollapse}
               />
@@ -170,7 +205,7 @@ export function Board() {
         )}
       </main>
 
-      <DetailPanel ticket={selected} onClose={() => setSelected(null)} />
+      <DetailPanel ticket={selected} onClose={() => setSelectedKey(null)} />
 
       <AddProjectDialog
         open={manageOpen}

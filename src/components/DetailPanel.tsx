@@ -38,17 +38,26 @@ export function DetailPanel({
     return () => clearTimeout(t)
   }, [ticket])
 
-  // Default to 01-spec.md (or the first artifact) whenever the shown ticket changes.
+  // Pick the artifact tab to show. Keyed on `[content]`, which now refreshes every 5s
+  // poll (PB-21: the panel tracks the live scan), so this must PRESERVE the user's open
+  // tab across updates — only auto-select a default when nothing is selected yet or the
+  // selection has vanished. Otherwise a run producing 02-plan.md…06-summary.md would yank
+  // the view back to 01-spec.md every poll.
   useEffect(() => {
     if (!content) {
       setSelectedFile(null)
       return
     }
-    setSelectedFile(
-      content.artifacts.includes('01-spec.md')
+    setSelectedFile((current) => {
+      // Keep the current tab if it's still present in the live artifact list.
+      if (current && content.artifacts.includes(current)) {
+        return current
+      }
+      // Nothing selected yet, or the selected file is gone — fall back to a default.
+      return content.artifacts.includes('01-spec.md')
         ? '01-spec.md'
-        : (content.artifacts[0] ?? null),
-    )
+        : (content.artifacts[0] ?? null)
+    })
   }, [content])
 
   // Close on Escape (only while open).

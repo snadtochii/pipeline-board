@@ -101,10 +101,10 @@ function freshRunningRun(overrides: Partial<TicketRunStatus> = {}): TicketRunSta
 }
 
 /**
- * Wait for a live (env-armed) run's fire-and-forget continuation to write its terminal status, so its
- * async file write lands BEFORE afterEach removes the tmp dir (otherwise rmdir races the write →
- * ENOTEMPTY). The continuation never spawns `claude` in tests — `project.path` lacks
- * `claudedocs/tickets/`, so runRealFlow short-circuits at preflight and writes `failed` fast.
+ * Wait for a run's fire-and-forget continuation to write its terminal status, so its async file write
+ * lands BEFORE afterEach removes the tmp dir (otherwise rmdir races the write → ENOTEMPTY). The
+ * continuation never spawns `claude` in tests — `project.path` lacks `claudedocs/tickets/`, so
+ * runRealFlow short-circuits at preflight and writes `failed` fast.
  */
 async function awaitTerminal(runId: string | undefined): Promise<void> {
   if (!runId) return

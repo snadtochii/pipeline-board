@@ -7,6 +7,13 @@ import { formatVersion } from '../lib/version'
 import { loadCollapsedColumns, saveCollapsedColumns } from '../lib/collapsed-columns'
 import { STATE_FOLDERS } from '../server/types'
 import type { Column as Col, ProjectScanResult, TicketDTO } from '../server/types'
+import { Column } from './Column'
+import { ProjectFilter } from './ProjectFilter'
+import { SyncControl } from './SyncControl'
+import { AddProjectDialog } from './AddProjectDialog'
+import { DetailPanel } from './DetailPanel'
+import { ProjectErrorChip } from './ProjectErrorChip'
+import { EmptyState } from './EmptyState'
 
 /** Stable identity of the open ticket (mirrors the dismissal effect's match trio).
  *  The panel resolves the live DTO from this each render, so it never freezes to an
@@ -40,13 +47,6 @@ function resolveSelected(
     ) ?? null
   )
 }
-import { Column } from './Column'
-import { ProjectFilter } from './ProjectFilter'
-import { SyncControl } from './SyncControl'
-import { AddProjectDialog } from './AddProjectDialog'
-import { DetailPanel } from './DetailPanel'
-import { ProjectErrorChip } from './ProjectErrorChip'
-import { EmptyState } from './EmptyState'
 
 export function Board() {
   const scan = useQuery({
@@ -103,7 +103,9 @@ export function Board() {
   // Resolve the open ticket from the LIVE scan each render (PB-21). This is what makes
   // the panel track the running flow — its artifact list and metadata block come from
   // the freshly-scanned DTO, not a snapshot captured at click time. Reuses the existing
-  // 5s scan poll; no second query.
+  // 5s scan poll; no second query. React Query's structural sharing keeps this reference
+  // stable between polls and re-points it only when the scanned ticket actually changes,
+  // so the panel re-renders on real changes, not on every poll.
   const selected = resolveSelected(selectedKey, results)
 
   // If the actively-filtered project disappears (e.g. removed via Manage projects),

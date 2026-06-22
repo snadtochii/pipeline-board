@@ -38,11 +38,12 @@ export function DetailPanel({
     return () => clearTimeout(t)
   }, [ticket])
 
-  // Pick the artifact tab to show. Keyed on `[content]`, which now refreshes every 5s
-  // poll (PB-21: the panel tracks the live scan), so this must PRESERVE the user's open
-  // tab across updates — only auto-select a default when nothing is selected yet or the
-  // selection has vanished. Otherwise a run producing 02-plan.md…06-summary.md would yank
-  // the view back to 01-spec.md every poll.
+  // Pick the artifact tab to show. Keyed on `[content]`, which now refreshes whenever the
+  // scanned ticket changes (PB-21: the panel tracks the live scan — structural sharing keeps
+  // the reference stable otherwise), so this must PRESERVE the user's open tab across those
+  // updates — only auto-select a default when nothing is selected yet or the selection has
+  // vanished. Otherwise a run producing 02-plan.md…06-summary.md would yank the view back to
+  // 01-spec.md when its new artifacts land.
   useEffect(() => {
     if (!content) {
       setSelectedFile(null)
@@ -346,8 +347,11 @@ function RunFlowControl({ ticket }: { ticket: TicketDTO }) {
         status?.prUrl ??
         'Run /feature:flow --pr for this ticket — spawns a real agent and opens a PR'
 
-  // Show the inline confirm only while idle — never mid-run. (busy can't change under us
-  // while confirming, but guard anyway so a race can't strand an actionable confirm.)
+  // Show the inline confirm only while idle — never mid-run. This HIDES the prompt while a
+  // run is active rather than resetting `confirming`; if an external run for this ticket (the
+  // sync CLI, another tab) flips the status to running and back, the prompt could briefly
+  // reappear. Harmless for a single-user local tool, and the ticket-swap key remount still
+  // bounds it.
   const showConfirm = confirming && !busy
 
   return (

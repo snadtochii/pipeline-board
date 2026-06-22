@@ -38,17 +38,27 @@ export function DetailPanel({
     return () => clearTimeout(t)
   }, [ticket])
 
-  // Default to 01-spec.md (or the first artifact) whenever the shown ticket changes.
+  // Pick the artifact tab to show. Keyed on `[content]`, which now refreshes whenever the
+  // scanned ticket changes (PB-21: the panel tracks the live scan — structural sharing keeps
+  // the reference stable otherwise), so this must PRESERVE the user's open tab across those
+  // updates — only auto-select a default when nothing is selected yet or the selection has
+  // vanished. Otherwise a run producing 02-plan.md…06-summary.md would yank the view back to
+  // 01-spec.md when its new artifacts land.
   useEffect(() => {
     if (!content) {
       setSelectedFile(null)
       return
     }
-    setSelectedFile(
-      content.artifacts.includes('01-spec.md')
+    setSelectedFile((current) => {
+      // Keep the current tab if it's still present in the live artifact list.
+      if (current && content.artifacts.includes(current)) {
+        return current
+      }
+      // Nothing selected yet, or the selected file is gone — fall back to a default.
+      return content.artifacts.includes('01-spec.md')
         ? '01-spec.md'
-        : (content.artifacts[0] ?? null),
-    )
+        : (content.artifacts[0] ?? null)
+    })
   }, [content])
 
   // Close on Escape (only while open).
@@ -219,8 +229,10 @@ function refusalMessage(reason: string): string {
 }
 
 /**
- * Per-ticket "Run Flow --pr" control + status chip (PB-14). Mirrors SyncControl's
- * mutation + polled-status + optimistic-invalidate pattern, scoped to one ticket.
+ * Per-ticket "Run" control + status chip (PB-14, PB-21). The button reads "Run" but
+ * triggers /feature:flow <id> --pr (a real agent that opens a PR) behind an inline
+ * confirm gate (PB-21). Mirrors SyncControl's mutation + polled-status +
+ * optimistic-invalidate pattern, scoped to one ticket.
  *
  * Always rendered with a non-null `ticket` (the panel's `content`), so its hooks
  * run unconditionally — no conditional-hook hazard. The parent gives it a
@@ -272,6 +284,13 @@ function RunFlowControl({ ticket }: { ticket: TicketDTO }) {
   // failed. Cleared on the next successful start.
   const [refusal, setRefusal] = useState<string | null>(null)
 
+  // Confirm gate (PB-21): a real Run now spawns an agent and opens a PR, so clicking
+  // "Run" first reveals an inline confirm/cancel pair naming the consequence — it does
+  // NOT spawn until the user confirms. Cancel resets with no run started. The pending
+  // state is reset on ticket swap for free: the parent's ticket-scoped `key` remounts
+  // this whole component (so `confirming` reverts to false), per PB-14.
+  const [confirming, setConfirming] = useState(false)
+
   const run = useMutation({
     mutationFn: () =>
       startTicketRun({
@@ -285,24 +304,40 @@ function RunFlowControl({ ticket }: { ticket: TicketDTO }) {
     onSuccess: (res) => {
       if (res.started) {
         setRefusal(null)
-        // startGuardedTicketRun is terminal-on-return in dry-run, so res.status is
-        // the final status — paint it immediately, no second poll needed.
+        // A real start returns the SEEDED `running` status — paint it immediately so the
+        // chip flips to "running…" without waiting for the next poll; the 5s poll then
+        // drives the terminal progression (succeeded / needs-human / failed).
         if (res.status) qc.setQueryData(key, res.status)
       } else {
         setRefusal(res.reason ?? 'could not start')
       }
     },
     // Mirror SyncControl: refetch so the chip reflects disk state regardless of the
-    // optimistic setQueryData above (and once PB-15's real runs are non-terminal).
+    // optimistic setQueryData above — real runs are non-terminal, so the seeded `running`
+    // status progresses on the 5s poll.
     onSettled: () => qc.invalidateQueries({ queryKey: key }),
   })
 
+  // Confirm path: dismiss the inline prompt and fire the real run.
+  const confirmRun = (): void => {
+    setConfirming(false)
+    run.mutate()
+  }
+
   const status = statusQ.data ?? null
-  // While the start RPC is in flight, treat the run as running — in dry-run this is
-  // the only genuine client-side "running" window (the server writes running then
-  // succeeded before returning), giving AC8 a real running indication.
+  // While the start RPC is in flight, treat the run as running so the button disables
+  // immediately on confirm — before the seeded `running` status lands in the cache.
   const running = isTicketRunRunning(status) || run.isPending
   const busy = running || !runnable
+
+  // If a run becomes active while the inline confirm is open — the user just confirmed, or an
+  // EXTERNAL run for this ticket (the sync CLI, another tab) flipped the polled status to
+  // running — clear `confirming` so the prompt can't resurface when the run later settles.
+  useEffect(() => {
+    if (busy && confirming) {
+      setConfirming(false)
+    }
+  }, [busy, confirming])
 
   const chip = run.isPending
     ? { label: 'running…', variant: 'running' as const }
@@ -319,28 +354,63 @@ function RunFlowControl({ ticket }: { ticket: TicketDTO }) {
         status?.error ??
         status?.logTail ??
         status?.prUrl ??
-        'Run /feature:flow --pr for this ticket'
+        'Run /feature:flow --pr for this ticket — spawns a real agent and opens a PR'
+
+  // Render-time guard: never show the confirm mid-run. The effect above also CLEARS
+  // `confirming` whenever a run is active, so the prompt can't resurface after the run
+  // settles — this `&& !busy` only covers the single render before that effect runs.
+  const showConfirm = confirming && !busy
 
   return (
     <div className="run">
-      <button
-        type="button"
-        className="primary run-btn"
-        onClick={() => run.mutate()}
-        disabled={busy}
-        aria-busy={running}
-        aria-label={`Run Flow --pr for ${ticket.id}`}
-        title={title}
-      >
-        Run Flow --pr
-      </button>
-      <span
-        className={`run-chip run-chip-${chip.variant}${run.isError ? ' run-chip-fail' : ''}`}
-        title={title}
-        aria-live="polite"
-      >
-        {run.isError ? 'start failed' : chip.label}
-      </span>
+      {showConfirm ? (
+        <div className="run-confirm" role="group" aria-label="Confirm running the flow">
+          <span className="run-confirm-msg">
+            Run <code>/feature:flow {ticket.id} --pr</code> for real? This spawns an agent and opens a
+            PR.
+          </span>
+          <span className="run-confirm-actions">
+            <button
+              type="button"
+              className="primary run-btn"
+              onClick={confirmRun}
+              autoFocus
+              aria-label={`Confirm: run /feature:flow --pr for ${ticket.id} (spawns a real agent and opens a PR)`}
+            >
+              Run
+            </button>
+            <button
+              type="button"
+              className="run-btn"
+              onClick={() => setConfirming(false)}
+              aria-label="Cancel running the flow"
+            >
+              Cancel
+            </button>
+          </span>
+        </div>
+      ) : (
+        <>
+          <button
+            type="button"
+            className="primary run-btn"
+            onClick={() => setConfirming(true)}
+            disabled={busy}
+            aria-busy={running}
+            aria-label={`Run /feature:flow --pr for ${ticket.id} (spawns a real agent and opens a PR)`}
+            title={title}
+          >
+            Run
+          </button>
+          <span
+            className={`run-chip run-chip-${chip.variant}${run.isError ? ' run-chip-fail' : ''}`}
+            title={title}
+            aria-live="polite"
+          >
+            {run.isError ? 'start failed' : chip.label}
+          </span>
+        </>
+      )}
     </div>
   )
 }

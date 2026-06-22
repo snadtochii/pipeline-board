@@ -145,20 +145,20 @@ export const startSync = createServerFn({ method: 'POST' }).handler(
 // ── Per-ticket flow runner (PB-13) ───────────────────────────────────────────
 // Standalone server fns (siblings to startSync) — NEVER nested or wrapped around
 // another server fn (TanStack/router #7213). All node:fs work lives in ./runs and
-// ./scanner, reached only inside these handler bodies. In PB-13 a run is a DRY RUN
-// (no claude spawned); PB-15 arms the real spawn behind an env gate.
+// ./scanner, reached only inside these handler bodies. Every start spawns a real
+// `/feature:flow` run (PB-15; always-real since PB-21 removed the dry-run path).
 
 // The start-result contract is owned by runs.ts (the orchestration layer); re-export
 // it here so client components importing from functions.ts get the same single type.
 export type { StartTicketRunResult } from './runs'
 
 /**
- * Start a (dry) run for one ticket. The validator enforces input shape AND the
- * defense-in-depth id guards (strict `PB-13`-style regex + safe-segment) on the
- * client-supplied `ticketId`/`parentEpicId` before they ever reach a run key or a
- * future spawned command. The handler resolves the project by display name, checks
- * the ticket exists, then delegates the guard+seed+finish to startGuardedTicketRun.
- * Non-spawning, terminal-on-return in PB-13.
+ * Start a real `/feature:flow <id> --pr` run for one ticket. The validator enforces input
+ * shape AND the defense-in-depth id guards (strict `PB-13`-style regex + safe-segment) on the
+ * client-supplied `ticketId`/`parentEpicId` before they ever reach a run key or the spawned
+ * command. The handler resolves the project by display name, checks the ticket exists, then
+ * delegates the guard+seed+fire-and-forget spawn to startGuardedTicketRun, which returns the
+ * seeded `running` status immediately (the 5s poll drives the terminal progression).
  */
 export const startTicketRun = createServerFn({ method: 'POST' })
   .validator(

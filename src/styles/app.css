@@ -111,6 +111,27 @@ button.icon {
   font-size: 12px;
   padding: 4px 10px;
 }
+/* Inline confirm gate (PB-21): the Run button is replaced in place by a short
+   consequence message + a Run/Cancel pair until the user confirms. Stacks the
+   message above the actions so the warning is read before the buttons. */
+.run-confirm {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.run-confirm-msg {
+  font-size: 12px;
+  color: var(--warn);
+}
+.run-confirm-msg code {
+  color: var(--text);
+}
+.run-confirm-actions {
+  display: flex;
+  gap: 8px;
+}
 /* nowrap + ellipsis so the status text (no runs yet / running… / succeeded 3m ago
    / needs attention 5m ago / failed 5m ago) never wraps or shoves the button — the
    panel width is fixed. */

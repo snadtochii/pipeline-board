@@ -330,6 +330,15 @@ function RunFlowControl({ ticket }: { ticket: TicketDTO }) {
   const running = isTicketRunRunning(status) || run.isPending
   const busy = running || !runnable
 
+  // If a run becomes active while the inline confirm is open — the user just confirmed, or an
+  // EXTERNAL run for this ticket (the sync CLI, another tab) flipped the polled status to
+  // running — clear `confirming` so the prompt can't resurface when the run later settles.
+  useEffect(() => {
+    if (busy && confirming) {
+      setConfirming(false)
+    }
+  }, [busy, confirming])
+
   const chip = run.isPending
     ? { label: 'running…', variant: 'running' as const }
     : runnable
@@ -347,11 +356,9 @@ function RunFlowControl({ ticket }: { ticket: TicketDTO }) {
         status?.prUrl ??
         'Run /feature:flow --pr for this ticket — spawns a real agent and opens a PR'
 
-  // Show the inline confirm only while idle — never mid-run. This HIDES the prompt while a
-  // run is active rather than resetting `confirming`; if an external run for this ticket (the
-  // sync CLI, another tab) flips the status to running and back, the prompt could briefly
-  // reappear. Harmless for a single-user local tool, and the ticket-swap key remount still
-  // bounds it.
+  // Render-time guard: never show the confirm mid-run. The effect above also CLEARS
+  // `confirming` whenever a run is active, so the prompt can't resurface after the run
+  // settles — this `&& !busy` only covers the single render before that effect runs.
   const showConfirm = confirming && !busy
 
   return (

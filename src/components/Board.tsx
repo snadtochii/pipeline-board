@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
+import { getRouteApi } from '@tanstack/react-router'
 import { listProjects, scanAll } from '../server/functions'
 import { POLL_INTERVAL_MS, queryKeys } from '../lib/query'
 import { comparatorFor } from '../lib/sort'
 import { formatVersion } from '../lib/version'
 import { loadCollapsedColumns, saveCollapsedColumns } from '../lib/collapsed-columns'
+import { isUnknownProjectFilter } from '../lib/project-filter'
 import { STATE_FOLDERS } from '../server/types'
 import type { Column as Col, ProjectScanResult, TicketDTO } from '../server/types'
 import { Column } from './Column'
@@ -48,6 +50,11 @@ function resolveSelected(
   )
 }
 
+// Bound to the index route ('/'); used to read/write the ?project= filter param.
+// getRouteApi avoids importing Route from routes/index.tsx, which imports Board
+// (the cycle that would otherwise form).
+const routeApi = getRouteApi('/')
+
 export function Board() {
   const scan = useQuery({
     queryKey: queryKeys.scan,
@@ -61,7 +68,14 @@ export function Board() {
     queryFn: () => listProjects(),
   })
 
-  const [filter, setFilter] = useState<string>('all') // 'all' | project name
+  // The selected project filter lives in the URL (?project=<name>) as the single
+  // source of truth (PB-22): survives refresh, is shareable, and SSR-consistent
+  // (validateSearch runs on server + client, so no flash of "All"). An absent
+  // param is the 'all' sentinel. Read via getRouteApi to dodge the routes/index →
+  // Board import cycle.
+  const { project } = routeApi.useSearch()
+  const navigate = routeApi.useNavigate()
+  const filter = project ?? 'all' // 'all' | project name
   // The open ticket is tracked by IDENTITY (projectName + id + parentEpicId), not by a
   // frozen DTO snapshot — so the panel re-resolves to the freshly-scanned object every
   // 5s poll and tracks the live scan (artifacts appearing, status/column advancing).
@@ -108,14 +122,27 @@ export function Board() {
   // so the panel re-renders on real changes, not on every poll.
   const selected = resolveSelected(selectedKey, results)
 
-  // If the actively-filtered project disappears (e.g. removed via Manage projects),
-  // fall back to "All" so the board doesn't render a false "no tickets" state.
+  // If the filtered project is unknown — removed via Manage projects, or a stale
+  // ?project= deep-link — strip the param so the board falls back to "All" instead
+  // of a false "no tickets" state. Gated on projectsQ.isSuccess so a VALID deep-link
+  // isn't clobbered before the project list loads (projects is [] until then). After
+  // the strip, filter becomes 'all' and isUnknownProjectFilter returns false — no
+  // loop. The panel-clear is handled by the [filter] effect below, which also covers
+  // the resulting 'all' transition.
   useEffect(() => {
-    if (filter !== 'all' && !projects.some((p) => p.name === filter)) {
-      setFilter('all')
-      setSelectedKey(null)
+    if (projectsQ.isSuccess && isUnknownProjectFilter(filter, projects)) {
+      navigate({ search: (prev) => ({ ...prev, project: undefined }), replace: true })
     }
-  }, [projects, filter])
+  }, [projectsQ.isSuccess, projects, filter, navigate])
+
+  // Dismiss the open detail panel whenever the filter changes — including via
+  // browser Back/Forward, which a URL-driven filter makes a real "filter change"
+  // that never goes through the <select> onChange. On mount selectedKey is null,
+  // so this is a no-op until a genuine change. The dep is the primitive filter
+  // string (stable across the 5s poll), so it doesn't churn.
+  useEffect(() => {
+    setSelectedKey(null)
+  }, [filter])
 
   // Dismiss the detail panel if its ticket is gone (project removed, ticket deleted):
   // when the identity no longer resolves in the live scan, clear the key so the panel
@@ -154,8 +181,18 @@ export function Board() {
 
   const firstLoading = scan.isLoading || projectsQ.isLoading
 
+  // Write the selection to the URL. Absent param for "all" keeps the default view a
+  // bare '/'; replace: true so filter switches don't pile up browser-history entries
+  // (Back doesn't cycle past selections). Clear the panel synchronously here too so
+  // the select-driven switch closes it in the same commit (no one-frame flash of a
+  // ticket from the just-deselected project, since `selected` resolves from the full
+  // unfiltered scan). The [filter] effect above still covers the Back/Forward and
+  // strip paths, which don't go through this handler.
   const refreshFilter = (next: string) => {
-    setFilter(next)
+    navigate({
+      search: (prev) => ({ ...prev, project: next === 'all' ? undefined : next }),
+      replace: true,
+    })
     setSelectedKey(null)
   }
 

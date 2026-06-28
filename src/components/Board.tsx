@@ -6,7 +6,7 @@ import { POLL_INTERVAL_MS, queryKeys } from '../lib/query'
 import { comparatorFor } from '../lib/sort'
 import { formatVersion } from '../lib/version'
 import { loadCollapsedColumns, saveCollapsedColumns } from '../lib/collapsed-columns'
-import { isUnknownProjectFilter } from '../lib/project-filter'
+import { pruneUnknownProjects, selectionKey } from '../lib/project-filter'
 import { STATE_FOLDERS } from '../server/types'
 import type { Column as Col, ProjectScanResult, TicketDTO } from '../server/types'
 import { Column } from './Column'
@@ -68,14 +68,19 @@ export function Board() {
     queryFn: () => listProjects(),
   })
 
-  // The selected project filter lives in the URL (?project=<name>) as the single
-  // source of truth (PB-22): survives refresh, is shareable, and SSR-consistent
-  // (validateSearch runs on server + client, so no flash of "All"). An absent
-  // param is the 'all' sentinel. Read via getRouteApi to dodge the routes/index →
-  // Board import cycle.
+  // The selected project filter lives in the URL as the single source of truth
+  // (PB-22 single-select → PB-23 multi-select): survives refresh, is shareable, and
+  // SSR-consistent (validateSearch runs on server + client, so no flash of "All").
+  // The `project` param now carries a list of selected names (`?project=["a","b"]`);
+  // an absent param == the empty selection == All projects. Read via getRouteApi to
+  // dodge the routes/index → Board import cycle.
   const { project } = routeApi.useSearch()
   const navigate = routeApi.useNavigate()
-  const filter = project ?? 'all' // 'all' | project name
+  const selectedProjects = project ?? [] // [] == All projects; else the selected names
+  // A poll-stable primitive key for the selection: the array is a fresh reference
+  // every render, so effects keyed on it directly would re-fire (and re-clear the
+  // open panel) every 5s poll. selKey only changes when the selected SET changes.
+  const selKey = selectionKey(selectedProjects)
   // The open ticket is tracked by IDENTITY (projectName + id + parentEpicId), not by a
   // frozen DTO snapshot — so the panel re-resolves to the freshly-scanned object every
   // 5s poll and tracks the live scan (artifacts appearing, status/column advancing).
@@ -122,27 +127,36 @@ export function Board() {
   // so the panel re-renders on real changes, not on every poll.
   const selected = resolveSelected(selectedKey, results)
 
-  // If the filtered project is unknown — removed via Manage projects, or a stale
-  // ?project= deep-link — strip the param so the board falls back to "All" instead
-  // of a false "no tickets" state. Gated on projectsQ.isSuccess so a VALID deep-link
-  // isn't clobbered before the project list loads (projects is [] until then). After
-  // the strip, filter becomes 'all' and isUnknownProjectFilter returns false — no
-  // loop. The panel-clear is handled by the [filter] effect below, which also covers
-  // the resulting 'all' transition.
+  // Prune any selected projects that are unknown — removed via Manage projects, or a
+  // stale ?project= deep-link — so the board falls back to the valid subset (or All
+  // if none remain) instead of a false "no tickets" state. Only UNKNOWN names are
+  // dropped; valid selections are kept. Gated on projectsQ.isSuccess so a VALID
+  // deep-link isn't clobbered before the project list loads (projects is [] until
+  // then). Pruning only ever shrinks the set, so once it's all-known the lengths
+  // match and it stops — no loop. The panel-clear is handled by the [selKey] effect
+  // below, which also covers the resulting selection change.
   useEffect(() => {
-    if (projectsQ.isSuccess && isUnknownProjectFilter(filter, projects)) {
-      navigate({ search: (prev) => ({ ...prev, project: undefined }), replace: true })
+    if (!projectsQ.isSuccess) {
+      return
     }
-  }, [projectsQ.isSuccess, projects, filter, navigate])
+    const pruned = pruneUnknownProjects(selectedProjects, projects)
+    if (pruned.length !== selectedProjects.length) {
+      navigate({
+        search: (prev) => ({ ...prev, project: pruned.length ? pruned : undefined }),
+        replace: true,
+      })
+    }
+  }, [projectsQ.isSuccess, projects, selKey, navigate])
 
-  // Dismiss the open detail panel whenever the filter changes — including via
-  // browser Back/Forward, which a URL-driven filter makes a real "filter change"
-  // that never goes through the <select> onChange. On mount selectedKey is null,
-  // so this is a no-op until a genuine change. The dep is the primitive filter
-  // string (stable across the 5s poll), so it doesn't churn.
+  // Dismiss the open detail panel whenever the selection changes — including via
+  // browser Back/Forward, which a URL-driven filter makes a real "selection change"
+  // that never goes through the dropdown's onChange. On mount selectedKey is null,
+  // so this is a no-op until a genuine change. The dep is the primitive selKey
+  // (stable across the 5s poll), NOT the selection array — an array dep is a fresh
+  // reference every render and would re-clear the panel on every poll.
   useEffect(() => {
     setSelectedKey(null)
-  }, [filter])
+  }, [selKey])
 
   // Dismiss the detail panel if its ticket is gone (project removed, ticket deleted):
   // when the identity no longer resolves in the live scan, clear the key so the panel
@@ -154,9 +168,16 @@ export function Board() {
     }
   }, [results, selectedKey])
 
-  const visible = filter === 'all' ? results : results.filter((r) => r.name === filter)
+  const visible =
+    selectedProjects.length === 0
+      ? results
+      : results.filter((r) => selectedProjects.includes(r.name))
   const errors = visible.filter((r) => r.error)
-  const showProject = filter === 'all' && projects.length > 1
+  // Show the per-card project badge whenever the visible set spans >1 project — any
+  // multi-project view, not just the pure "All" view (PB-23). An empty selection ==
+  // All, so its breadth is the full configured project count.
+  const showProject =
+    (selectedProjects.length === 0 ? projects.length : selectedProjects.length) > 1
 
   const byColumn = useMemo(() => {
     const map: Record<Col, TicketDTO[]> = {
@@ -181,16 +202,16 @@ export function Board() {
 
   const firstLoading = scan.isLoading || projectsQ.isLoading
 
-  // Write the selection to the URL. Absent param for "all" keeps the default view a
-  // bare '/'; replace: true so filter switches don't pile up browser-history entries
-  // (Back doesn't cycle past selections). Clear the panel synchronously here too so
-  // the select-driven switch closes it in the same commit (no one-frame flash of a
-  // ticket from the just-deselected project, since `selected` resolves from the full
-  // unfiltered scan). The [filter] effect above still covers the Back/Forward and
-  // strip paths, which don't go through this handler.
-  const refreshFilter = (next: string) => {
+  // Write the selection to the URL. An empty selection drops the param, keeping the
+  // default view a bare '/'; replace: true so selection toggles don't pile up
+  // browser-history entries (Back doesn't cycle past every toggle). Clear the panel
+  // synchronously here too so a dropdown-driven change closes it in the same commit
+  // (no one-frame flash of a ticket from a just-deselected project, since `selected`
+  // resolves from the full unfiltered scan). The [selKey] effect above still covers
+  // the Back/Forward and prune paths, which don't go through this handler.
+  const refreshFilter = (next: string[]) => {
     navigate({
-      search: (prev) => ({ ...prev, project: next === 'all' ? undefined : next }),
+      search: (prev) => ({ ...prev, project: next.length ? next : undefined }),
       replace: true,
     })
     setSelectedKey(null)
@@ -204,7 +225,7 @@ export function Board() {
           <span className="app-version">{formatVersion(__APP_VERSION__)}</span>
         </div>
         <div className="actions">
-          <ProjectFilter projects={projects} value={filter} onChange={refreshFilter} />
+          <ProjectFilter projects={projects} selected={selectedProjects} onChange={refreshFilter} />
           <button type="button" onClick={() => setManageOpen(true)}>
             Manage projects
           </button>

@@ -217,12 +217,61 @@ button.icon {
 .filter-label {
   color: var(--muted);
 }
-.filter select {
-  background: var(--panel-2);
-  color: var(--text);
+/* PB-23 multi-select project filter: a checkbox dropdown replacing the old <select>.
+   The trigger inherits the base button look (panel-2 fill, border, 6px radius); the
+   panel is an absolutely-positioned popover anchored to the position:relative wrapper.
+   z-index 30 sits above the board/cards (col-head 2) but below the detail panel (40)
+   and modal (50). */
+.project-filter {
+  position: relative;
+}
+.project-filter-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.project-filter-caret {
+  color: var(--muted);
+  font-size: 10px;
+}
+.project-filter-panel {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 30;
+  min-width: 200px;
+  max-height: 60vh;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px;
+  background: var(--panel);
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+}
+.project-filter-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   padding: 6px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.project-filter-option:hover {
+  background: var(--panel-2);
+}
+.project-filter-option input {
+  accent-color: var(--accent);
+  cursor: pointer;
+  margin: 0;
+}
+.project-filter-divider {
+  height: 1px;
+  background: var(--border);
+  margin: 4px 2px;
 }
 .error-row {
   grid-area: errors;
